@@ -51,10 +51,11 @@ t.animate((g, v) => {            // g = glyph {n, w, cx...}, v = its pose
   v.alpha = m; v.dy = (1-m)*160; v.skew = (1-m)*.6; v.rot = (1-m)*.25;   // also v.dx, v.sx
 });
 ```
-That is how words wave, stretch letter-by-letter or fly in staggered. The template ships the
-simpler whole-block version (`text()` + `.pose()`); upgrade path: measure each glyph with
-`measureText`, pack into one canvas, build an `InstancedBufferGeometry` with per-instance
-`rect, uv, transform, colour` attributes, and write the pose array every frame.
+That is how words wave, stretch letter-by-letter or fly in staggered. The template implements
+the same idea as `ctx.type()`: glyph positions come from `measureText` of each prefix (so kerning
+is kept), unique characters are shelf-packed into one Canvas2D atlas, and an
+`InstancedBufferGeometry` carries per-glyph `rect, uv, (dx,dy,sx,sy), (rot,skew,alpha)` attributes
+rewritten by `.animate()` each frame. `ctx.text()` remains for static copy.
 
 ## 5. Transition pipeline
 Both scenes keep running during a transition. Each frame: render outgoing → RT A, incoming → RT B,
@@ -65,8 +66,8 @@ const fade = { dur:.7, create(ctx){ const P = ctx.gfx.pass(`...frag...`, {tA:nul
 ```
 Fancier reference transitions are not just a fragment shader: `tear` and `fold` build actual
 geometry (paper mesh with a paper texture and lighting), `portal-*` raymarch, `flaps` is a
-split-flap board of instanced quads. The template's versions are single-pass approximations; see
-`transitions.md` for how to go further. Backwards navigation reuses the entering transition,
+split-flap board of instanced quads. The template supports both forms (`frag` string or
+`create()` returning `render()`), and its `fold`, `tear` and `flaps` are geometry; see `transitions.md`. Backwards navigation reuses the entering transition,
 played reversed at 0.55× duration. Each transition also emits an audio event so the sound designer
 (below) can score it.
 
@@ -99,9 +100,37 @@ unlocked on the first key press; `M` mutes.
   with multiple attachments, mipmapped procedural textures generated once in `create()`.
 - `dt` is clamped so a hidden tab doesn't jump animations.
 
+Template: `park()` keeps the current scene, its neighbours and the scenes of a running transition;
+everything else is disposed (`disposeTree` frees geometries, materials and textures, plus the scene's
+own `dispose()`), and the transition instances not needed for the current/next step are released.
+Rebuilding later is safe because `update(s)` is pure. `deck.step(sec)` runs the simulation at a fixed
+60 fps without the rAF loop (`?headless`), which is what makes screenshots deterministic.
+
 ## 10. Chrome / UI
 Keys: → ↓ Space PageDown Enter = next · ← ↑ PageUp Backspace = back · Home/End · F fullscreen ·
 A autoplay · M mute · N notes · P (presenter) · O overview · ? or H help · B or . blackout · Esc.
 Cursor hides after 2.2 s idle. URL hash `#scene-beat` both reflects and drives position.
 Notes open in a separate window (for the second screen) with an inline fallback. The overview
 renders real thumbnails of every scene's final state.
+
+## 11. Template vs reference: what is covered
+| feature | reference | template |
+|---|---|---|
+| virtual 1920×1080 view with bleed | ✓ | ✓ |
+| scenes / beats / pure `update(s)` / `s.enter`, `s.exit` | ✓ | ✓ |
+| per-letter instanced type | ✓ | ✓ `ctx.type()` |
+| fragment transitions | ✓ | ✓ 7 |
+| geometry transitions | ✓ fold, tear, flaps, portal (raymarch) | ✓ fold, tear, flaps (portal is fragment) |
+| scene + transition parking | ✓ | ✓ |
+| HUD colour as a function, per-beat page labels | ✓ | ✓ |
+| notes window, overview thumbnails, help, autoplay, blackout, hash routing | ✓ | ✓ (+ elapsed timer and "next" in notes) |
+| headless, deterministic stepping | ✓ `?headless` | ✓ `?headless` + `deck.step()` + `scripts/verify.js` |
+| offline single file (inlined three.js + fonts) | ✓ | ✓ via `scripts/inline.py` |
+| WebGL-missing / context-loss handling | ✓ | ✓ |
+| post: bloom, tone mapping, CA, halation, lift/gain | ✓ | ✗ only vignette, grain, blackout |
+| scored procedural audio per transition + ambient bed per scene | ✓ | partial: 5 one-shot sounds |
+| mouse-driven interaction, selection-box UI | ✓ | ✗ (`s.mouse` not provided) |
+
+The release file `the-last-boring-slide.html` on GitHub (op7418/nexttoken-topics) is the same
+minified build as the published artifact, with no source map: identical symbol names
+(`Ky={id:"boat"...}`). There is no readable source to copy, so everything above is reconstructed.

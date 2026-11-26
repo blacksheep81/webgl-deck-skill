@@ -2,9 +2,9 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>WebGL Deck</title>
-<!-- Fonts: for a fully offline single file, replace this link with base64 @font-face / FontFace (see references/architecture.md §7) -->
+<!-- Fonts + three.js come from CDNs here. For an offline single file run scripts/inline.py on this file. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300..700;1,6..72,300..700&family=Geist+Mono:wght@400;500&family=Anton&display=swap">
 <style>
@@ -15,8 +15,8 @@ body{margin:0;overflow:hidden;background:var(--bg);color:var(--text);font:15px/1
 #stage{position:fixed;inset:0;width:100%;height:100%;display:block;outline:none;touch-action:none}
 #ui{position:fixed;inset:0;pointer-events:none}
 #ui>*{pointer-events:auto}
-body.idle{cursor:none}
-.hud{position:absolute;right:28px;bottom:20px;font-size:14px;letter-spacing:.04em;pointer-events:none!important;transition:color .4s}
+body.idle,body.headless{cursor:none}
+.hud{position:absolute;right:max(28px,env(safe-area-inset-right));bottom:max(20px,env(safe-area-inset-bottom));font-size:14px;letter-spacing:.04em;pointer-events:none!important;font-variant-numeric:tabular-nums}
 .notes{position:absolute;left:0;right:0;bottom:0;padding:18px 24px;background:var(--panel);display:flex;gap:24px;justify-content:space-between}
 .notes p{margin:0;max-width:70ch;font-size:18px;white-space:pre-line}
 .notes .meta{color:var(--dim);white-space:nowrap}
@@ -28,9 +28,19 @@ body.idle{cursor:none}
 .help{position:absolute;right:24px;bottom:56px;background:var(--panel);padding:18px 22px;display:grid;grid-template-columns:auto auto;gap:6px 18px;border-radius:8px}
 .help b{font-weight:500}.help span{color:var(--dim)}
 .toast{position:absolute;left:50%;bottom:34px;transform:translateX(-50%);background:var(--panel);padding:8px 14px;border-radius:6px;transition:opacity .3s}
-.load{position:absolute;inset:0;background:#fff;color:#404040;display:grid;place-content:center}
+.load{position:absolute;inset:0;background:#fff;color:#404040;display:grid;place-content:center;gap:12px;text-align:center;padding:24px;font-size:16px}
+.load b{font-size:20px;color:#14161c}
 @media (max-width:600px){.over{padding:16px;grid-template-columns:1fr 1fr;gap:12px}.help{left:16px;right:16px}}
 </style>
+<script>
+/* Boot watchdog (classic script, runs even if the module below never loads, e.g. CDN blocked or offline). */
+window.__deckFail = function (title, detail) {
+  var l = document.querySelector('.load') || document.getElementById('ui').appendChild(document.createElement('div'));
+  l.className = 'load'; l.innerHTML = '<b></b><span></span>'; l.firstChild.textContent = title; l.lastChild.textContent = detail || '';
+};
+setTimeout(function () { if (!window.__deckBooted) window.__deckFail('The presentation could not start.',
+  'three.js did not load (offline or blocked CDN?). Use the offline build made with scripts/inline.py, or check the browser console.'); }, 12000);
+</script>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
 </head>
 <body>
@@ -38,6 +48,10 @@ body.idle{cursor:none}
 <div id="ui"><div class="load">Loading…</div></div>
 <script type="module">
 import * as THREE from 'three';
+
+const QS = new URLSearchParams(location.search);
+const HEADLESS = QS.has('headless');          // ?headless: no rAF loop, no audio. Driven by deck.step() (scripts/verify.js)
+if (HEADLESS) document.body.classList.add('headless');
 
 /* ============================================================
    0. MATH + EASING  (scenes animate with these, never with CSS)
@@ -48,6 +62,7 @@ const ease = {
   linear: t => t,
   out3: t => 1 - Math.pow(1 - t, 3),
   out4: t => 1 - Math.pow(1 - t, 4),
+  in3: t => t * t * t,
   io3: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
   outBack: t => { const c = 1.7; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); },
 };
@@ -56,34 +71,43 @@ const rng = seed => { let s = (seed * 2654435761) >>> 0 || 1; return () => (s ^=
 /* ============================================================
    1. GFX: renderer, virtual 1920x1080 view, render targets, passes
    ============================================================ */
-THREE.ColorManagement.enabled = false;              // hex in = pixels out. No colour-space surprises.
+const fail = (t, d) => { window.__deckBooted = true; window.__deckFail(t, d); };
 const canvas = document.getElementById('stage');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: false });
+let renderer;
+try {
+  if (!document.createElement('canvas').getContext('webgl2')) throw new Error('WebGL2 unavailable');
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: HEADLESS, powerPreference: 'high-performance' });
+} catch (e) {
+  fail('This presentation needs WebGL 2.', 'Try a current Chrome, Edge, Firefox or Safari, and make sure hardware acceleration is on. (' + e.message + ')');
+  throw e;
+}
+THREE.ColorManagement.enabled = false;              // hex in = pixels out. No colour-space surprises.
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+// GPU reset (driver crash, too many tabs): the page reloads to the same #scene-beat.
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); toast('Graphics reset, reloading…'); });
+canvas.addEventListener('webglcontextrestored', () => location.reload());
 
 // Virtual stage: everything is authored in a 1920x1080 box (y down). The box is fitted
 // inside the window; the camera extends past it so wide/tall screens get bleed, never bars.
 const view = (() => {
   const cam = new THREE.OrthographicCamera(0, 1920, 0, 1080, -1000, 1000);
-  const v = { cam, w: 1920, h: 1080, x0: 0, y0: 0, aspect: 16 / 9,
+  const v = { cam, w: 1920, h: 1080, x0: 0, y0: 0, x1: 1920, y1: 1080, aspect: 16 / 9,
     resize(W, H) {
       const k = Math.min(W / 1920, H / 1080);
-      v.w = W / k; v.h = H / k; v.x0 = (1920 - v.w) / 2; v.y0 = (1080 - v.h) / 2; v.aspect = W / H;
-      cam.left = v.x0; cam.right = v.x0 + v.w; cam.top = v.y0; cam.bottom = v.y0 + v.h;
-      cam.updateProjectionMatrix();
+      v.w = W / k; v.h = H / k; v.x0 = (1920 - v.w) / 2; v.y0 = (1080 - v.h) / 2; v.x1 = v.x0 + v.w; v.y1 = v.y0 + v.h; v.aspect = W / H;
+      cam.left = v.x0; cam.right = v.x1; cam.top = v.y0; cam.bottom = v.y1; cam.updateProjectionMatrix();
     } };
   return v;
 })();
 
-const target = (w = 1, h = 1) => new THREE.WebGLRenderTarget(w, h, { depthBuffer: true, samples: 4 });
+const target = () => new THREE.WebGLRenderTarget(1, 1, { depthBuffer: true, samples: 4 });
 const rtA = target(), rtB = target(), rtC = target();
 const quadGeo = new THREE.PlaneGeometry(2, 2);
 const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`;
-// Shared GLSL helpers available to every pass (transitions + post)
+// Shared GLSL helpers, prepended to every pass and available to your own shaders as ctx.GLSL_LIB
 const GLSL_LIB = `
-varying vec2 vUv;
 float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
 float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f*f*(3.-2.*f);
   return mix(mix(hash12(i), hash12(i+vec2(1,0)), f.x), mix(hash12(i+vec2(0,1)), hash12(i+vec2(1,1)), f.x), f.y); }
@@ -91,60 +115,154 @@ float fbm(vec2 p){ float s = 0., a = .5; for(int i=0;i<5;i++){ s += a*vnoise(p);
 float luma(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
 `;
 function pass(frag, uniforms = {}) {
-  const mat = new THREE.ShaderMaterial({ vertexShader: VERT, fragmentShader: GLSL_LIB + frag, uniforms: {
+  const mat = new THREE.ShaderMaterial({ vertexShader: VERT, fragmentShader: 'varying vec2 vUv;\n' + GLSL_LIB + frag, uniforms: {
     tA: { value: null }, tB: { value: null }, p: { value: 0 }, uAspect: { value: 16 / 9 }, uTime: { value: 0 },
     ...Object.fromEntries(Object.entries(uniforms).map(([k, v]) => [k, { value: v }])) }, depthTest: false, depthWrite: false });
   const mesh = new THREE.Mesh(quadGeo, mat); const sc = new THREE.Scene(); sc.add(mesh); mesh.frustumCulled = false;
-  return { u: mat.uniforms, render(out) { renderer.setRenderTarget(out || null); renderer.render(sc, quadCam); } };
+  return { u: mat.uniforms, mat, render(out) { renderer.setRenderTarget(out || null); renderer.render(sc, quadCam); }, dispose() { mat.dispose(); } };
+}
+// Release everything a scene graph holds on the GPU (used when a scene is parked)
+function disposeTree(root) {
+  if (!root) return;
+  root.traverse(o => {
+    if (o.geometry && o.geometry !== quadGeo) o.geometry.dispose();
+    for (const m of [].concat(o.material || [])) {
+      for (const k in m) if (m[k] && m[k].isTexture) m[k].dispose();
+      if (m.uniforms) for (const k in m.uniforms) { const v = m.uniforms[k].value; if (v && v.isTexture && !v.isRenderTargetTexture) v.dispose(); }
+      m.dispose();
+    }
+  });
 }
 
 /* ============================================================
-   2. TEXT: Canvas2D-rasterised text blocks as textured planes
-      (advanced: per-glyph instanced quads -> references/architecture.md §4)
+   2. TEXT
+      text()  whole block rasterised to one texture. Cheap. For static copy.
+      type()  per-glyph instanced quads. Every letter can move on its own.
    ============================================================ */
 const FONTS = { display: '400 {s}px Newsreader, Georgia, serif', italic: 'italic 300 {s}px Newsreader, Georgia, serif',
   mono: '500 {s}px "Geist Mono", monospace', poster: '400 {s}px Anton, Impact, sans-serif' };
-function text(str, o = {}) {
-  o = { x: 0, y: 0, size: 64, font: 'display', color: '#111', align: 'left', valign: 'top', leading: 1.15, tracking: 0, maxWidth: 0, ...o };
-  const RES = 2;                                       // raster at 2x virtual px so it stays crisp on 4K
-  const c = document.createElement('canvas'), g = c.getContext('2d');
-  const font = FONTS[o.font].replace('{s}', o.size * RES);
-  g.font = font; if ('letterSpacing' in g) g.letterSpacing = (o.tracking * o.size * RES) + 'px';
-  // word wrap
+const TEXT_DEFAULTS = { x: 0, y: 0, size: 64, font: 'display', color: '#111', align: 'left', valign: 'top', leading: 1.15, tracking: 0, maxWidth: 0 };
+function wrap(g, str, maxWidth) {
   const lines = [];
   for (const para of String(str).split('\n')) {
-    if (!o.maxWidth) { lines.push(para); continue; }
+    if (!maxWidth) { lines.push(para); continue; }
     let cur = '';
     for (const w of para.split(' ')) { const t = cur ? cur + ' ' + w : w;
-      if (g.measureText(t).width > o.maxWidth * RES && cur) { lines.push(cur); cur = w; } else cur = t; }
+      if (g.measureText(t).width > maxWidth && cur) { lines.push(cur); cur = w; } else cur = t; }
     lines.push(cur);
   }
+  return lines;
+}
+const setFont = (g, o, scale) => { g.font = FONTS[o.font].replace('{s}', o.size * scale); if ('letterSpacing' in g) g.letterSpacing = (o.tracking * o.size * scale) + 'px'; };
+
+function text(str, o = {}) {
+  o = { ...TEXT_DEFAULTS, ...o };
+  const RES = Math.min(2, 1400 / o.size);              // raster scale; keeps huge type under GPU texture limits
+  const c = document.createElement('canvas'), g = c.getContext('2d');
+  setFont(g, o, RES);
+  const lines = wrap(g, str, o.maxWidth * RES);
   const lh = o.size * o.leading * RES, pad = o.size * .4 * RES;
   const tw = Math.max(1, ...lines.map(l => g.measureText(l).width));
   c.width = Math.ceil(tw + pad * 2); c.height = Math.ceil(lh * lines.length + pad * 2);
-  g.font = font; if ('letterSpacing' in g) g.letterSpacing = (o.tracking * o.size * RES) + 'px';
-  g.fillStyle = o.color; g.textBaseline = 'middle';
-  g.textAlign = o.align;
+  setFont(g, o, RES); g.fillStyle = o.color; g.textBaseline = 'middle'; g.textAlign = o.align;
   const ax = o.align === 'center' ? c.width / 2 : o.align === 'right' ? c.width - pad : pad;
   lines.forEach((l, i) => g.fillText(l, ax, pad + lh * (i + .5)));
   const tex = new THREE.CanvasTexture(c); tex.flipY = false; tex.anisotropy = 4;   // flipY off because the view is y-down
   const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, side: THREE.DoubleSide });
-  const W = c.width / RES, H = c.height / RES;
+  const W = c.width / RES, H = c.height / RES, P = pad / RES;
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(W, H), mat); mesh.renderOrder = 10;
-  const ox = o.align === 'center' ? 0 : o.align === 'right' ? -W / 2 + pad / RES : W / 2 - pad / RES;
-  const oy = o.valign === 'middle' ? 0 : o.valign === 'bottom' ? -H / 2 + pad / RES : H / 2 - pad / RES;
-  mesh.userData.home = new THREE.Vector2(o.x + ox, o.y + oy);
-  mesh.position.set(o.x + ox, o.y + oy, 0);
-  // convenience: set alpha / offset in one call each frame
+  const ox = o.align === 'center' ? 0 : o.align === 'right' ? -W / 2 + P : W / 2 - P;
+  const oy = o.valign === 'middle' ? 0 : o.valign === 'bottom' ? -H / 2 + P : H / 2 - P;
+  const home = new THREE.Vector2(o.x + ox, o.y + oy);
+  mesh.position.set(home.x, home.y, 0);
   mesh.pose = (alpha = 1, dx = 0, dy = 0, s = 1, rot = 0) => {
     mat.opacity = alpha; mesh.visible = alpha > .001;
-    mesh.position.set(mesh.userData.home.x + dx, mesh.userData.home.y + dy, 0); mesh.scale.setScalar(s); mesh.rotation.z = rot;
+    mesh.position.set(home.x + dx, home.y + dy, 0); mesh.scale.setScalar(s); mesh.rotation.z = rot; return mesh;
   };
   return mesh;
 }
+
+const GLYPH_VERT = `
+attribute vec4 iRect, iUv, iA, iB;  // rect: centre xy + size wh (virtual px) | uv rect | dx dy sx sy | rot skew alpha -
+varying vec2 vUv; varying float vAlpha;
+void main(){
+  vec2 l = vec2(position.x, -position.y) * iRect.zw;       // local quad, y down
+  l.x -= l.y * iB.y;                                        // skew: positive leans the top to the right
+  l *= iA.zw;
+  float c = cos(iB.x), s = sin(iB.x); l = vec2(c*l.x - s*l.y, s*l.x + c*l.y);
+  vec2 w = iRect.xy + iA.xy + l;
+  vUv = vec2(mix(iUv.x, iUv.z, position.x + .5), mix(iUv.y, iUv.w, .5 - position.y));
+  vAlpha = iB.z;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(w, 0., 1.);
+}`;
+const GLYPH_FRAG = `uniform sampler2D tA; uniform vec3 uColor; uniform float uOpacity; varying vec2 vUv; varying float vAlpha;
+void main(){ float a = texture2D(tA, vUv).a * vAlpha * uOpacity; if (a < .003) discard; gl_FragColor = vec4(uColor, a); }`;
+
+function type(str, o = {}) {
+  o = { ...TEXT_DEFAULTS, ...o };
+  const R = Math.min(2, 360 / o.size);                    // atlas raster scale per glyph
+  const g = document.createElement('canvas').getContext('2d');
+  setFont(g, o, 1);
+  const lines = wrap(g, str, o.maxWidth).map(l => Array.from(l));
+  const lh = o.size * o.leading, H = lh * lines.length;
+  const y0 = o.valign === 'middle' ? o.y - H / 2 : o.valign === 'bottom' ? o.y - H : o.y;
+  const pad = o.size * .3, cellH = o.size * 1.5 + pad * 2;
+  const glyphs = []; let n = 0;
+  lines.forEach((chars, li) => {
+    const line = chars.join(''), lw = g.measureText(line).width;
+    const x0 = o.align === 'center' ? o.x - lw / 2 : o.align === 'right' ? o.x - lw : o.x;
+    chars.forEach((ch, i) => {
+      if (ch === ' ') return;
+      const adv = g.measureText(chars.slice(0, i).join('')).width, w = g.measureText(ch).width;
+      glyphs.push({ n: n++, ch, line: li, col: i, x: x0 + adv, w, cx: x0 + adv + w / 2, cy: y0 + lh * (li + .5), h: o.size });
+    });
+  });
+  // atlas: one cell per unique character, shelf-packed
+  const uniq = [...new Set(glyphs.map(q => q.ch))], cells = {};
+  g.font = FONTS[o.font].replace('{s}', o.size); if ('letterSpacing' in g) g.letterSpacing = '0px';
+  let ax = 0, ay = 0, rowH = Math.ceil(cellH * R), maxW = 2048, atlasW = 1;
+  for (const ch of uniq) {
+    const cw = Math.ceil((g.measureText(ch).width + pad * 2) * R);
+    if (ax + cw > maxW) { ax = 0; ay += rowH; }
+    cells[ch] = { x: ax, y: ay, w: cw }; ax += cw; atlasW = Math.max(atlasW, ax);
+  }
+  const atlas = document.createElement('canvas'); atlas.width = atlasW; atlas.height = Math.max(1, ay + rowH);
+  const ag = atlas.getContext('2d'); ag.font = FONTS[o.font].replace('{s}', o.size * R); ag.fillStyle = '#fff'; ag.textBaseline = 'middle';
+  for (const ch of uniq) { const c = cells[ch]; ag.fillText(ch, c.x + pad * R, c.y + rowH / 2); }
+  const tex = new THREE.CanvasTexture(atlas); tex.flipY = false; tex.generateMipmaps = true; tex.minFilter = THREE.LinearMipmapLinearFilter;
+
+  const N = Math.max(1, glyphs.length), base = new THREE.PlaneGeometry(1, 1);
+  const geo = new THREE.InstancedBufferGeometry(); geo.index = base.index; geo.setAttribute('position', base.attributes.position);
+  const attr = k => { const a = new THREE.InstancedBufferAttribute(new Float32Array(N * 4), 4); a.setUsage(THREE.DynamicDrawUsage); geo.setAttribute(k, a); return a; };
+  const aRect = attr('iRect'), aUv = attr('iUv'), aA = attr('iA'), aB = attr('iB');
+  glyphs.forEach((q, i) => { const c = cells[q.ch], cw = c.w / R;
+    aRect.setXYZW(i, q.x - pad + cw / 2, q.cy, cw, cellH);
+    aUv.setXYZW(i, c.x / atlas.width, c.y / atlas.height, (c.x + c.w) / atlas.width, (c.y + rowH) / atlas.height);
+    aA.setXYZW(i, 0, 0, 1, 1); aB.setXYZW(i, 0, 0, 1, 0); });
+  geo.instanceCount = glyphs.length;
+  const mat = new THREE.ShaderMaterial({ vertexShader: GLYPH_VERT, fragmentShader: GLYPH_FRAG, transparent: true, depthTest: false, depthWrite: false,
+    side: THREE.DoubleSide, uniforms: { tA: { value: tex }, uColor: { value: new THREE.Color(o.color) }, uOpacity: { value: 1 } } });
+  const mesh = new THREE.Mesh(geo, mat); mesh.frustumCulled = false; mesh.renderOrder = 10;
+  const bx = Math.min(...glyphs.map(q => q.x)), bw = Math.max(...glyphs.map(q => q.x + q.w)) - bx;
+  mesh.glyphs = glyphs; mesh.bounds = { x: bx, y: y0, w: bw, h: H, cx: bx + bw / 2, cy: y0 + H / 2 };
+  const v = {};
+  // animate((glyph, pose) => { pose.dx/dy/sx/sy/rot/skew/alpha = ... }) — call it from update(s) every frame
+  mesh.animate = fn => {
+    glyphs.forEach((q, i) => { v.dx = 0; v.dy = 0; v.sx = 1; v.sy = 1; v.rot = 0; v.skew = 0; v.alpha = 1; fn(q, v, i);
+      aA.setXYZW(i, v.dx, v.dy, v.sx, v.sy); aB.setXYZW(i, v.rot, v.skew, v.alpha, 0); });
+    aA.needsUpdate = aB.needsUpdate = true; return mesh;
+  };
+  mesh.pose = (alpha = 1, dx = 0, dy = 0, s = 1) => {
+    mat.uniforms.uOpacity.value = alpha; mesh.visible = alpha > .001; mesh.scale.set(s, s, 1);
+    mesh.position.set(mesh.bounds.cx * (1 - s) + dx, mesh.bounds.cy * (1 - s) + dy, 0); return mesh;
+  };
+  mesh.color = hex => { mat.uniforms.uColor.value.set(hex); return mesh; };
+  return mesh;
+}
+
 const rect = (x, y, w, h, color) => {               // top-left anchored box in virtual px
   const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color, transparent: true, side: THREE.DoubleSide }));
-  m.set = (X, Y, W, H) => { m.position.set(X + W / 2, Y + H / 2, 0); m.scale.set(Math.max(W, 1e-3), Math.max(H, 1e-3), 1); };
+  m.set = (X, Y, W, H) => { m.position.set(X + W / 2, Y + H / 2, 0); m.scale.set(Math.max(W, 1e-3), Math.max(H, 1e-3), 1); return m; };
   m.set(x, y, w, h); return m;
 };
 
@@ -153,39 +271,47 @@ const rect = (x, y, w, h, color) => {               // top-left anchored box in 
    ============================================================ */
 const audio = (() => {
   let ac = null, master = null, muted = false;
-  const unlock = () => { if (ac) return; const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  const unlock = () => { if (ac || HEADLESS) return; const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
     ac = new AC(); master = ac.createGain(); master.gain.value = .5; master.connect(ac.destination); };
   const noise = (dur) => { const b = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate), d = b.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; const s = ac.createBufferSource(); s.buffer = b; return s; };
+  const env = (g, t, peak, a, dur) => { g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(peak, t + a); g.gain.exponentialRampToValueAtTime(.001, t + dur); };
   return {
     unlock, get muted() { return muted; }, mute() { muted = !muted; if (master) master.gain.value = muted ? 0 : .5; },
     whoosh(dur = .8, f0 = 200, f1 = 2400) { if (!ac || muted) return; const t = ac.currentTime, n = noise(dur),
       f = ac.createBiquadFilter(), g = ac.createGain(); f.type = 'bandpass'; f.Q.value = .9;
       f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + dur * .6);
-      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.5, t + dur * .35); g.gain.exponentialRampToValueAtTime(.001, t + dur);
-      n.connect(f).connect(g).connect(master); n.start(t); n.stop(t + dur); },
+      env(g, t, .5, dur * .35, dur); n.connect(f).connect(g).connect(master); n.start(t); n.stop(t + dur); },
+    rip(dur = 1) { if (!ac || muted) return; const t = ac.currentTime, n = noise(dur), f = ac.createBiquadFilter(), g = ac.createGain();
+      f.type = 'highpass'; f.frequency.value = 1800; g.gain.setValueAtTime(0, t);
+      for (let i = 0; i < 18; i++) g.gain.setValueAtTime(Math.random() * .5, t + .1 + i * dur * .03);   // crackle
+      g.gain.exponentialRampToValueAtTime(.001, t + dur); n.connect(f).connect(g).connect(master); n.start(t); n.stop(t + dur); },
+    clack(dur = 1) { if (!ac || muted) return; for (let i = 0; i < 14; i++) { const t = ac.currentTime + Math.random() * dur * .8,
+      o = ac.createOscillator(), g = ac.createGain(); o.type = 'square'; o.frequency.value = 900 + Math.random() * 700;
+      env(g, t, .08, .002, .04); o.connect(g).connect(master); o.start(t); o.stop(t + .05); } },
     tick(freq = 1200) { if (!ac || muted) return; const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
       o.frequency.setValueAtTime(freq, t); o.frequency.exponentialRampToValueAtTime(freq * .5, t + .08);
-      g.gain.setValueAtTime(.18, t); g.gain.exponentialRampToValueAtTime(.001, t + .1); o.connect(g).connect(master); o.start(t); o.stop(t + .12); },
+      env(g, t, .18, .002, .1); o.connect(g).connect(master); o.start(t); o.stop(t + .12); },
     thud() { if (!ac || muted) return; const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
       o.type = 'sine'; o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(40, t + .25);
-      g.gain.setValueAtTime(.6, t); g.gain.exponentialRampToValueAtTime(.001, t + .35); o.connect(g).connect(master); o.start(t); o.stop(t + .4); },
+      env(g, t, .6, .005, .35); o.connect(g).connect(master); o.start(t); o.stop(t + .4); },
   };
 })();
 
 /* ============================================================
-   4. TRANSITIONS: each one is { dur, sound, frag }.
-      frag gets: tA (outgoing frame), tB (incoming frame), p (0..1), uAspect, uTime.
+   4. TRANSITIONS
+      Simple form:   { dur, sound, frag }           fragment shader over tA (outgoing), tB (incoming), p 0..1
+      Full form:     { dur, sound, create(ctx) }   returns { render({A,B,p,out,aspect,time}), dispose() }
+                     for transitions made of real geometry (fold, tear, flaps)
    ============================================================ */
 const TRANSITIONS = {
-  fade: { dur: .7, sound: null, frag: `uniform sampler2D tA,tB; uniform float p;
+  fade: { dur: .7, frag: `uniform sampler2D tA,tB; uniform float p;
     void main(){ gl_FragColor = mix(texture2D(tA,vUv), texture2D(tB,vUv), smoothstep(0.,1.,p)); }` },
 
   // A glowing scan line sweeps across; behind it the new slide.
   line: { dur: 1.1, sound: 'tick', frag: `uniform sampler2D tA,tB; uniform float p;
     void main(){ float e = mix(-.05, 1.05, smoothstep(0.,1.,p));
-      float wob = .012*sin(vUv.y*24. + p*9.);
-      float x = vUv.x + wob;
+      float x = vUv.x + .012*sin(vUv.y*24. + p*9.);
       vec3 c = x < e ? texture2D(tB,vUv).rgb : texture2D(tA,vUv).rgb;
       float glow = exp(-abs(x-e)*140.) * sin(3.14159*clamp(p,0.,1.));
       gl_FragColor = vec4(c + vec3(1.,.95,.8)*glow*1.4, 1.); }` },
@@ -199,62 +325,38 @@ const TRANSITIONS = {
       vec2 ub = (vUv-.5)/s + .5 + shake;
       vec3 a = texture2D(tA, (vUv-.5)*(1.-.08*k)+.5).rgb * (1.-.7*k);
       bool inB = all(greaterThanEqual(ub, vec2(0.))) && all(lessThanEqual(ub, vec2(1.)));
-      vec3 b = texture2D(tB, ub).rgb;
-      float alpha = smoothstep(0., .15, k);
-      gl_FragColor = vec4(inB ? mix(a, b, alpha) : a, 1.); }` },
+      gl_FragColor = vec4(inB ? mix(a, texture2D(tB, ub).rgb, smoothstep(0., .15, k)) : a, 1.); }` },
 
-  // A folds over like a page turned right-to-left; the back of the page is shaded paper.
-  fold: { dur: 1.3, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p;
-    void main(){ float f = 1. - smoothstep(0.,1.,p);          // fold line x
-      float x = vUv.x; vec3 c;
-      if (x > f) {                                              // uncovered: new slide, shadowed near the crease
-        c = texture2D(tB, vUv).rgb * (1. - .45*exp(-(x-f)*18.)*step(.001,f));
-      } else if (x > 2.*f - 1.) {                               // the folded flap (back of page A)
-        vec2 m = vec2(2.*f - x, vUv.y);
-        vec3 a = texture2D(tA, m).rgb;
-        float shade = .55 + .45*clamp((x-(2.*f-1.))/(1.-f+1e-4), 0., 1.);
-        c = mix(vec3(.93,.91,.87), a, .18) * shade;             // paper back, faint show-through
-      } else {
-        c = texture2D(tA, vUv).rgb * (1. - .35*exp(-((2.*f-1.)-x)*25.)); // flat part of A, shadow under flap
-      }
-      gl_FragColor = vec4(c, 1.); }` },
-
-  // A rips down a ragged vertical line; both halves pull apart with a fibrous paper edge.
-  tear: { dur: 1.4, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p; uniform float uAspect;
-    float edge(float y){ return .5 + .05*(fbm(vec2(y*6., 1.7))-.5)*2. + .012*(vnoise(vec2(y*90., 3.))-.5); }
-    void main(){ float k = smoothstep(0.,1.,p); float d = k*.62;
-      vec2 uv = vUv;
-      vec2 L = vec2(uv.x + d, uv.y + k*.04*(uv.x)), R = vec2(uv.x - d, uv.y - k*.03*(1.-uv.x));
-      float eL = edge(L.y), eR = edge(R.y);
-      vec3 c = texture2D(tB, uv).rgb;
-      float fib = .004 + .004*vnoise(vec2(uv.y*400., 0.));
-      if (L.x < eL) c = (L.x > eL - fib) ? vec3(.97,.95,.9) : texture2D(tA, L).rgb;
-      else if (R.x > eR) c = (R.x < eR + fib) ? vec3(.97,.95,.9) : texture2D(tA, R).rgb;
-      else c *= 1. - .35*(1.-k);                                 // the gap starts in shadow
+  // Ink/water wash: B bleeds in along a wet, noisy front; pigment pools at the edge.
+  wash: { dur: 1.6, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p, uAspect;
+    void main(){ vec2 q = vUv*vec2(uAspect,1.);
+      float field = vUv.x*.75 + (fbm(q*2.2 + vec2(0., p*.6)) - .5)*.55 + (vnoise(q*14.)-.5)*.05;
+      float th = mix(-.35, 1.1, smoothstep(0.,1.,p));
+      float m = smoothstep(th+.015, th-.015, field);
+      float wet = exp(-pow((field-th)/.05, 2.));
+      vec2 wob = vec2(fbm(q*6.+p), fbm(q*6.-p)) - .5;
+      vec3 a = texture2D(tA, vUv + wob*.012*wet).rgb, b = texture2D(tB, vUv + wob*.02*wet).rgb;
+      vec3 c = mix(a, b, m) * (1. - .35*exp(-pow((field-th)/.012, 2.)));   // pooled pigment line
       gl_FragColor = vec4(c, 1.); }` },
 
   // Circular portal opens from the centre; content is lens-distorted around the rim.
-  'portal-in': { dur: 1.2, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p; uniform float uAspect;
+  'portal-in': { dur: 1.2, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p, uAspect;
     void main(){ vec2 q = (vUv-.5)*vec2(uAspect,1.); float r = length(q);
       float R = smoothstep(0.,1.,p) * (length(vec2(uAspect,1.))*.5 + .1);
-      float w = .08;
       vec2 dir = r > 0. ? q/r : vec2(0.);
-      float bend = exp(-pow((r-R)/w, 2.));
+      float bend = exp(-pow((r-R)/.08, 2.));
       vec2 ua = vUv - dir/vec2(uAspect,1.)*bend*.05*(1.-p);
       vec2 ub = (vUv-.5)*mix(1.35, 1., p) + .5 + dir/vec2(uAspect,1.)*bend*.04;
       vec3 c = r < R ? texture2D(tB, ub).rgb : texture2D(tA, ua).rgb * (1.-.5*p);
-      c += vec3(.6,.75,1.)*bend*.6*sin(3.14159*p);
-      gl_FragColor = vec4(c, 1.); }` },
+      gl_FragColor = vec4(c + vec3(.6,.75,1.)*bend*.6*sin(3.14159*p), 1.); }` },
 
   // Reverse: A collapses into a shrinking circle over B.
-  'portal-out': { dur: 1.1, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p; uniform float uAspect;
+  'portal-out': { dur: 1.1, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p, uAspect;
     void main(){ vec2 q = (vUv-.5)*vec2(uAspect,1.); float r = length(q);
       float R = (1.-smoothstep(0.,1.,p)) * (length(vec2(uAspect,1.))*.5 + .1);
       float bend = exp(-pow((r-R)/.07, 2.));
-      vec2 ua = (vUv-.5)*mix(1., .6, p) + .5;
-      vec3 c = r < R ? texture2D(tA, ua).rgb : texture2D(tB, (vUv-.5)*mix(1.25,1.,p)+.5).rgb;
-      c += vec3(1.)*bend*.5*sin(3.14159*p);
-      gl_FragColor = vec4(c, 1.); }` },
+      vec3 c = r < R ? texture2D(tA, (vUv-.5)*mix(1., .6, p) + .5).rgb : texture2D(tB, (vUv-.5)*mix(1.25,1.,p)+.5).rgb;
+      gl_FragColor = vec4(c + vec3(1.)*bend*.5*sin(3.14159*p), 1.); }` },
 
   // Light rises from the bottom: bright areas of A burn through first, warm glow at the front.
   daybreak: { dur: 1.6, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p;
@@ -263,8 +365,114 @@ const TRANSITIONS = {
       float th = mix(-.1, 1.25, p);
       float m = smoothstep(th, th-.12, field);
       float front = exp(-pow((field-th)/.06, 2.)) * sin(3.14159*p);
-      vec3 c = mix(a, b, m) + vec3(1.,.62,.25)*front*1.2;
-      gl_FragColor = vec4(c, 1.); }` },
+      gl_FragColor = vec4(mix(a, b, m) + vec3(1.,.62,.25)*front*1.2, 1.); }` },
+
+  /* ---- geometry transitions ---- */
+
+  // Page curl: A is a 256-segment mesh rolled around a moving, slightly tilted cylinder.
+  // Front is lit by the cylinder normal; the back is paper with A faintly showing through.
+  fold: { dur: 1.5, sound: 'whoosh', create(ctx) {
+    const R = .2, PHI = .16;
+    const bg = pass(`uniform sampler2D tB; uniform float uC, uAspect, uR, uPhi;
+      void main(){ vec2 q = (vUv*2.-1.)*vec2(uAspect,1.); float d = cos(uPhi)*q.x + sin(uPhi)*q.y - uC;
+        vec3 b = texture2D(tB, vUv).rgb; b *= 1. - .5*exp(-max(d - uR*.85, 0.)*7.)*step(0., d);   // shadow cast by the roll
+        gl_FragColor = vec4(b, 1.); }`, { uC: 0, uR: R, uPhi: PHI });
+    const mat = new THREE.ShaderMaterial({ side: THREE.DoubleSide, depthTest: true, depthWrite: true,
+      uniforms: { tA: { value: null }, uC: { value: 0 }, uR: { value: R }, uPhi: { value: PHI }, uAspect: { value: 16 / 9 } },
+      vertexShader: `uniform float uC, uR, uPhi, uAspect; varying vec2 vUv; varying float vShade;
+        void main(){ vUv = uv; vec2 q = position.xy*vec2(uAspect,1.);
+          float c = cos(uPhi), s = sin(uPhi); vec2 r = vec2(c*q.x + s*q.y, -s*q.x + c*q.y);
+          float z = 0., a = r.x - uC, th = 0.;
+          if (a > 0.) { if (a < 3.14159*uR) { th = a/uR; r.x = uC + uR*sin(th); z = uR*(1.-cos(th)); }
+                        else { th = 3.14159; r.x = uC - (a - 3.14159*uR); z = 2.*uR; } }
+          vShade = .55 + .45*abs(cos(th)) + .25*pow(max(0., sin(th*1.0 - .6)), 6.);   // edge-on = darker, + a soft highlight
+          vec2 o = vec2(c*r.x - s*r.y, s*r.x + c*r.y);
+          gl_Position = vec4(o.x/uAspect, o.y, -z*.2, 1.); }`,
+      fragmentShader: `uniform sampler2D tA; varying vec2 vUv; varying float vShade;
+        ${GLSL_LIB}
+        void main(){ vec3 a = texture2D(tA, vUv).rgb; vec3 col;
+          if (gl_FrontFacing) col = a * vShade;
+          else { float grain = .96 + .04*vnoise(vUv*vec2(900.,500.)); col = mix(vec3(.94,.92,.88)*grain, a, .12) * (.75 + .25*vShade); }
+          gl_FragColor = vec4(col, 1.); }` });
+    const page = new THREE.Mesh(new THREE.PlaneGeometry(2, 2, 256, 4), mat); page.frustumCulled = false;
+    const sc = new THREE.Scene(); sc.add(page);
+    return {
+      render({ A, B, p, out, aspect }) {
+        const ext = aspect * Math.cos(PHI) + Math.sin(PHI), C = lerp(ext, -ext - R - .05, ease.io3(p));
+        bg.u.tB.value = B.texture; bg.u.uC.value = C; bg.u.uAspect.value = aspect; bg.render(out);
+        mat.uniforms.tA.value = A.texture; mat.uniforms.uC.value = C; mat.uniforms.uAspect.value = aspect;
+        renderer.autoClear = false; renderer.clearDepth(); renderer.render(sc, quadCam); renderer.autoClear = true;
+      },
+      dispose() { bg.dispose(); mat.dispose(); page.geometry.dispose(); },
+    };
+  } },
+
+  // Paper tear: A splits along a ragged fbm edge into two meshes that swing and fall apart,
+  // each with a drop shadow and a white fibrous rim.
+  tear: { dur: 1.5, sound: 'rip', create(ctx) {
+    const mk = (side, shadow) => new THREE.ShaderMaterial({ transparent: true, depthTest: false, side: THREE.DoubleSide,
+      uniforms: { tA: { value: null }, k: { value: 0 }, uAspect: { value: 16 / 9 }, uSide: { value: side }, uShadow: { value: shadow } },
+      vertexShader: `uniform float k, uAspect, uSide, uShadow; varying vec2 vUv;
+        void main(){ vUv = uv; vec2 q = position.xy*vec2(uAspect,1.);
+          vec2 piv = vec2(uSide*uAspect, -1.);                  // swing around the bottom outer corner
+          float a = -uSide*k*.16; vec2 d = q - piv; q = piv + vec2(cos(a)*d.x - sin(a)*d.y, sin(a)*d.x + cos(a)*d.y);
+          q += vec2(uSide*k*k*uAspect*.9, -k*k*.35) + uShadow*vec2(.025, -.035)*k;
+          gl_Position = vec4(q.x/uAspect, q.y, 0., 1.); }`,
+      fragmentShader: `uniform sampler2D tA; uniform float k, uSide, uShadow; varying vec2 vUv;
+        ${GLSL_LIB}
+        float edge(float y){ return .5 + .1*(fbm(vec2(y*5., 1.7))-.5) + .018*(vnoise(vec2(y*90., 3.))-.5); }
+        void main(){ float e = edge(vUv.y), d = (vUv.x - e) * uSide;     // d > 0 inside this piece
+          if (d < 0.) discard;
+          if (uShadow > .5) { gl_FragColor = vec4(0.,0.,0., .32*smoothstep(0.,.02,d)*smoothstep(0.,.1,k)); return; }
+          float fib = .003 + .006*vnoise(vec2(vUv.y*500., uSide*7.));
+          vec3 c = d < fib ? vec3(.97,.95,.9) : texture2D(tA, vUv).rgb;
+          gl_FragColor = vec4(c, 1.); }` });
+    const mats = [mk(-1, 1), mk(1, 1), mk(-1, 0), mk(1, 0)], geo = new THREE.PlaneGeometry(2, 2), sc = new THREE.Scene();
+    mats.forEach((m, i) => { const me = new THREE.Mesh(geo, m); me.renderOrder = i; me.frustumCulled = false; sc.add(me); });
+    const bg = pass(`uniform sampler2D tB; uniform float p; void main(){ gl_FragColor = vec4(texture2D(tB, vUv).rgb*(.6+.4*p), 1.); }`);
+    return {
+      render({ A, B, p, out, aspect }) {
+        bg.u.tB.value = B.texture; bg.u.p.value = p; bg.render(out);
+        const k = ease.in3(clamp((p - .08) / .92)) * 1.2 + .02 * Math.sin(p * 60) * (1 - p);   // small tug, then the rip
+        mats.forEach(m => { m.uniforms.tA.value = A.texture; m.uniforms.k.value = k; m.uniforms.uAspect.value = aspect; });
+        renderer.autoClear = false; renderer.render(sc, quadCam); renderer.autoClear = true;
+      },
+      dispose() { mats.forEach(m => m.dispose()); geo.dispose(); bg.dispose(); },
+    };
+  } },
+
+  // Split-flap board: a 16x9 grid of tiles flips over in a staggered wave, A on the front, B on the back.
+  flaps: { dur: 1.7, sound: 'clack', create(ctx) {
+    const COLS = 16, ROWS = 9, N = COLS * ROWS, r = rng(7);
+    const base = new THREE.PlaneGeometry(1, 1), geo = new THREE.InstancedBufferGeometry();
+    geo.index = base.index; geo.setAttribute('position', base.attributes.position);
+    const cell = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) { const c = i % COLS, rw = (i / COLS) | 0; cell.set([c, rw, (c / COLS) * .7 + (1 - rw / ROWS) * .1 + r() * .2], i * 3); }
+    geo.setAttribute('aCell', new THREE.InstancedBufferAttribute(cell, 3)); geo.instanceCount = N;
+    const cam = new THREE.PerspectiveCamera(30, 16 / 9, .1, 20); cam.position.set(0, 0, 1 / Math.tan(15 * Math.PI / 180));
+    const mat = new THREE.ShaderMaterial({ side: THREE.DoubleSide, depthTest: true,
+      uniforms: { tA: { value: null }, tB: { value: null }, p: { value: 0 }, uAspect: { value: 16 / 9 }, uGrid: { value: new THREE.Vector2(COLS, ROWS) } },
+      vertexShader: `attribute vec3 aCell; uniform float p, uAspect; uniform vec2 uGrid; varying vec2 vUa, vUb; varying float vShade;
+        void main(){ vec2 sz = 1./uGrid; vec2 o = aCell.xy*sz;
+          float t = clamp((p - aCell.z*.5)/.5, 0., 1.); t = t*t*(3.-2.*t); float th = 3.14159*t;
+          vec2 l = position.xy;                                      // -.5..+.5
+          vUa = o + (l + .5)*sz; vUb = o + vec2(l.x + .5, .5 - l.y)*sz;
+          vec2 cen = (o + .5*sz)*2. - 1.; vec2 hs = sz*vec2(uAspect, 1.)*.992;
+          vec3 w = vec3(cen.x*uAspect + l.x*hs.x*2., cen.y + l.y*hs.y*2.*cos(th), l.y*hs.y*2.*sin(th));
+          vShade = .45 + .55*abs(cos(th));
+          gl_Position = projectionMatrix * viewMatrix * vec4(w, 1.); }`,
+      fragmentShader: `uniform sampler2D tA, tB; varying vec2 vUa, vUb; varying float vShade;
+        void main(){ vec3 c = gl_FrontFacing ? texture2D(tA, vUa).rgb : texture2D(tB, vUb).rgb; gl_FragColor = vec4(c*vShade, 1.); }` });
+    const mesh = new THREE.Mesh(geo, mat); mesh.frustumCulled = false; const sc = new THREE.Scene(); sc.add(mesh); sc.background = new THREE.Color('#0c0c0e');
+    return {
+      render({ A, B, p, out, aspect }) {
+        cam.aspect = aspect; cam.updateProjectionMatrix();
+        mat.uniforms.tA.value = A.texture; mat.uniforms.tB.value = B.texture; mat.uniforms.p.value = p; mat.uniforms.uAspect.value = aspect;
+        renderer.setRenderTarget(out); renderer.render(sc, cam);
+      },
+      dispose() { mat.dispose(); geo.dispose(); },
+    };
+  } },
 };
 
 /* ============================================================
@@ -281,6 +489,8 @@ const post = pass(`uniform sampler2D tA; uniform float uTime, uBlack, uVig, uGra
       s.p[i]      progress 0..1 of beat i (beats play in order, one per keypress)
       s.k(i,a,b)  eased 0..1 over seconds a..b inside beat i
       s.t         seconds since the scene was entered
+      s.enter     0..1 while this scene's entering transition plays (1 otherwise)
+      s.exit      0..1 while it is leaving (0 otherwise)
    ============================================================ */
 const SCENES = [
   {
@@ -289,38 +499,58 @@ const SCENES = [
             { dur: 1.6, notes: 'The subtitle lands. Then move on.' }],
     create(ctx) {
       const scene = new THREE.Scene(); scene.background = new THREE.Color('#f4efe6');
-      const h = ctx.text('The Last\nBoring Slide', { x: 140, y: 380, size: 170, font: 'display', color: '#14161c', leading: 1.0, valign: 'middle' });
+      const h = ctx.type('The Last\nBoring Slide', { x: 140, y: 380, size: 170, font: 'display', color: '#14161c', leading: 1.0, valign: 'middle' });
       const sub = ctx.text('a deck that moves like an idea', { x: 146, y: 640, size: 46, font: 'italic', color: '#8a5a2b' });
       const bar = ctx.rect(146, 720, 0, 6, '#14161c');
       scene.add(h, sub, bar);
       return { scene, update(s) {
-        const a = s.k(0, 0, 1.4, ease.out4);
-        h.pose(a, 0, (1 - a) * 60);
+        h.animate((g, v) => { const m = s.k(0, g.n * .045, g.n * .045 + .9, ease.out4); v.alpha = m; v.dy = (1 - m) * 70; v.rot = (1 - m) * .12; });
         const b = s.k(1, 0, 1.0, ease.out3);
         sub.pose(b, (1 - b) * -40, 0); bar.set(146, 720, 520 * s.k(1, .2, 1.4, ease.io3), 6);
       } };
     },
   },
   {
-    id: 'growth', title: 'Bars', enterWith: 'line', hud: '#ffffff',
+    id: 'growth', title: 'Bars', enterWith: 'flaps', hud: '#ffffff',
     beats: [{ dur: 1.5, notes: 'Start with the baseline.' },
             { dur: 2.5, notes: 'Each year doubles. Watch the last bar.' },
-            { dur: 1.5, notes: 'The punchline in one number.' }],
+            { dur: 1.5, page: '32×', notes: 'The punchline in one number.' }],     // page: custom HUD label for this beat
     create(ctx) {
       const scene = new THREE.Scene(); scene.background = new THREE.Color('#121a2b');
       const vals = [1, 2, 4, 8, 16, 32], bars = vals.map(() => ctx.rect(0, 0, 0, 0, '#5b8cff'));
       const title = ctx.text('Doubling is not linear.', { x: 120, y: 110, size: 78, color: '#ffffff' });
-      const big = ctx.text('32×', { x: 1180, y: 300, size: 220, font: 'poster', color: '#ffd21f', align: 'right', valign: 'middle' });
+      const big = ctx.type('32×', { x: 1180, y: 300, size: 220, font: 'poster', color: '#ffd21f', align: 'right', valign: 'middle' });
       scene.add(title, big, ...bars);
       return { scene, update(s) {
         title.pose(s.k(0, 0, 1, ease.out4));
         vals.forEach((v, i) => {
           const g = i === 0 ? s.k(0, .2, 1.2, ease.out3) : s.k(1, i * .3, i * .3 + .9, ease.outBack);
-          const h = 700 * v / 32 * g, x = 160 + i * 250;
-          bars[i].set(x, 940 - h, 170, h);
+          const h = 700 * v / 32 * g;
+          bars[i].set(160 + i * 250, 940 - h, 170, h);
           bars[i].material.color.set(i === vals.length - 1 && s.p[2] > 0 ? '#ffd21f' : '#5b8cff');
         });
-        const k = s.k(2, 0, .8, ease.outBack); big.pose(k, 0, 0, .6 + .4 * k);
+        big.animate((g, v) => { const m = s.k(2, g.n * .08, g.n * .08 + .6, ease.outBack); v.alpha = clamp(m * 3); v.sy = m; v.dy = (1 - m) * 60; });
+      } };
+    },
+  },
+  {
+    id: 'momentum', title: 'Momentum', enterWith: 'slam', hud: s => s.p[1] > .5 ? '#ffffff' : '#15110a',   // HUD colour can follow the scene
+    beats: [{ dur: 1.6, notes: 'One word, letters arriving like freight cars.' },
+            { dur: 2.4, notes: 'Then it starts to breathe on its own. Keep talking over it.' }],
+    create(ctx) {
+      const scene = new THREE.Scene(); const bg = new THREE.Color('#ffd21f'), bg2 = new THREE.Color('#15110a'); scene.background = bg.clone();
+      const w = ctx.type('MOMENTUM', { x: 960, y: 560, size: 420, font: 'poster', color: '#15110a', align: 'center', valign: 'middle' });
+      scene.add(w);
+      return { scene, update(s) {
+        const k1 = s.k(1, 0, 1.2, ease.io3);
+        scene.background.copy(bg).lerp(bg2, k1); w.color(k1 > .5 ? '#ffd21f' : '#15110a');
+        // widths ripple along the word; letters are re-packed so the word keeps its total width
+        const ws = w.glyphs.map(g => g.w * (1 + .28 * k1 * Math.sin(s.t * 3.2 - g.n * .9)));
+        const tot = ws.reduce((a, b) => a + b, 0), scale = w.bounds.w / tot; let x = w.bounds.x;
+        w.animate((g, v) => {
+          const gw = ws[g.n] * scale; v.sx = gw / g.w; v.dx = x + gw / 2 - g.cx; x += gw;
+          const m = s.k(0, g.n * .07, g.n * .07 + .55, ease.out4); v.dy = (1 - m) * (g.n % 2 ? 900 : -900); v.alpha = clamp(m * 4);
+        });
       } };
     },
   },
@@ -335,159 +565,210 @@ const SCENES = [
         new THREE.MeshStandardMaterial({ color: '#ff6a3d', roughness: .35, metalness: .2 }));
       scene.add(knot, new THREE.AmbientLight('#556', 1.2));
       const l = new THREE.DirectionalLight('#fff', 3); l.position.set(3, 4, 5); scene.add(l);
-      // 2D overlay layer drawn on top with the shared ortho camera
       const overlay = new THREE.Scene(); const cap = ctx.text('Geometry, not pictures.', { x: 120, y: 940, size: 64, color: '#fff', valign: 'bottom' }); overlay.add(cap);
       return { scene, camera, overlay, update(s) {
         knot.rotation.set(s.t * .4, s.t * .6, 0);
-        knot.scale.setScalar(ease.out4(s.k(0, 0, 1.6)) + 1e-3);
+        knot.scale.setScalar(ease.out4(s.k(0, 0, 1.6)) * (1 - .3 * s.exit) + 1e-3);    // shrinks a little as we leave
         camera.position.set(0, 0, lerp(9, 5.2, s.k(1, 0, 2, ease.io3))); camera.lookAt(0, 0, 0);
         cap.pose(s.k(0, .8, 2, ease.out3));
       } };
     },
   },
   {
-    id: 'questions', title: 'Questions', enterWith: 'daybreak', hud: '#7f7f7f',
+    id: 'futures', title: 'Two futures', enterWith: 'tear', hud: '#f1ede4',
+    beats: [{ dur: 1.4, notes: 'Here the road splits.' }, { dur: 1.4, notes: 'Pick one on purpose.' }],
+    create(ctx) {
+      const scene = new THREE.Scene(); scene.background = new THREE.Color('#1d2b2c');
+      const a = ctx.text('Drift', { x: 480, y: 540, size: 150, color: '#f1ede4', align: 'center', valign: 'middle' });
+      const b = ctx.text('Aim', { x: 1440, y: 540, size: 150, font: 'italic', color: '#ffb35c', align: 'center', valign: 'middle' });
+      const line = ctx.rect(959, 200, 2, 680, '#f1ede4');
+      scene.add(a, b, line);
+      return { scene, update(s) { const k = s.k(0, 0, 1, ease.out4); a.pose(k, 0, (1 - k) * 40); line.set(959, 540 - 340 * k, 2, 680 * k);
+        const m = s.k(1, 0, 1, ease.outBack); b.pose(clamp(m * 2), 0, 0, .8 + .2 * m); a.pose(k * (1 - .6 * s.p[1]), 0, (1 - k) * 40); } };
+    },
+  },
+  {
+    id: 'questions', title: 'Questions', enterWith: 'fold', hud: '#7f7f7f',
     beats: [{ dur: 1.4, notes: 'Thank them. Stop talking.' }],
     create(ctx) {
       const scene = new THREE.Scene(); scene.background = new THREE.Color('#ffffff');
-      const q = ctx.text('Any questions?', { x: 960, y: 540, size: 140, color: '#14161c', align: 'center', valign: 'middle' });
+      const q = ctx.type('Any questions?', { x: 960, y: 540, size: 140, color: '#14161c', align: 'center', valign: 'middle' });
       scene.add(q);
-      return { scene, update(s) { const a = s.k(0, 0, 1.2, ease.out4); q.pose(a, 0, 0, .94 + .06 * a); } };
+      return { scene, update(s) { q.animate((g, v) => { const m = s.k(0, g.n * .03, g.n * .03 + .8, ease.out4); v.alpha = m; v.dy = (1 - m) * 30; }); } };
     },
   },
 ];
 
 /* ============================================================
-   7. ENGINE: scene state, beats, transitions, render loop
+   7. ENGINE: scene state, beats, transitions, parking, simulation + drawing
    ============================================================ */
-const ctx = { THREE, view, text, rect, audio, ease, clamp, lerp, rng };
+const ctx = { THREE, renderer, view, text, type, rect, pass, audio, ease, clamp, lerp, rng, GLSL_LIB };
 class Slot {
   constructor(def, i) { this.def = def; this.i = i; this.inst = null; const n = def.beats.length;
-    this.s = { t: 0, beat: 0, n, p: new Array(n).fill(0), since: new Array(n).fill(0),
+    this.s = { t: 0, beat: 0, n, p: new Array(n).fill(0), since: new Array(n).fill(0), enter: 1, exit: 0,
       at: i => this.s.p[i] * def.beats[i].dur,
       k: (i, a, b, e = ease.linear) => e(clamp((this.s.p[i] * def.beats[i].dur - a) / Math.max(1e-4, b - a))) }; }
   ensure() { if (!this.inst) this.inst = this.def.create(ctx); return this; }
-  reset(beat = 0, complete = false) { const s = this.s; s.t = complete ? 30 : 0; s.beat = beat;
+  park() { if (!this.inst) return; this.inst.dispose && this.inst.dispose(); disposeTree(this.inst.scene); disposeTree(this.inst.overlay); this.inst = null; }
+  reset(beat = 0, complete = false) { const s = this.s; s.t = complete ? 30 : 0; s.beat = beat; s.enter = 1; s.exit = 0;
     for (let i = 0; i < s.n; i++) { s.p[i] = complete && i <= beat ? 1 : 0; s.since[i] = 0; } }
   step(dt) { const s = this.s, B = this.def.beats; s.t += dt;
     for (let i = 0; i < s.n; i++) {
       if (i <= s.beat) { s.since[i] += dt; if (s.since[i] >= (B[i].delay || 0)) s.p[i] = Math.min(1, s.p[i] + dt / B[i].dur * (i < s.beat ? 3 : 1)); }
       else { s.since[i] = 0; s.p[i] = Math.max(0, s.p[i] - dt / B[i].dur * 2.4); }   // rewinding a beat runs fast backwards
     }
-    this.inst.update(s); }
-  render(out, aspect) { const { scene, camera, overlay } = this.inst; const cam = camera || view.cam;
+    this.ensure().inst.update(s); }
+  render(out, aspect) { const { scene, camera, overlay } = this.ensure().inst; const cam = camera || view.cam;
     if (cam.isPerspectiveCamera && cam.aspect !== aspect) { cam.aspect = aspect; cam.updateProjectionMatrix(); }
     renderer.setRenderTarget(out); renderer.render(scene, cam);
     if (overlay) { renderer.autoClear = false; renderer.render(overlay, view.cam); renderer.autoClear = true; } }
 }
 const slots = SCENES.map((d, i) => new Slot(d, i));
-const passes = {};
-const tpass = name => passes[name] || (passes[name] = pass(TRANSITIONS[name].frag));
-let cur = 0, trans = null, black = 0, blackTo = 0, auto = false, holdT = 0;
+const tInst = {};
+function transition(name) {
+  if (tInst[name]) return tInst[name];
+  const def = TRANSITIONS[name] || TRANSITIONS.fade;
+  if (def.create) return (tInst[name] = def.create(ctx));
+  const P = pass(def.frag);
+  return (tInst[name] = { render({ A, B, p, out, aspect, time }) { P.u.tA.value = A.texture; P.u.tB.value = B.texture; P.u.p.value = p;
+    P.u.uAspect.value = aspect; P.u.uTime.value = time; P.render(out); }, dispose: P.dispose });
+}
+// Parking: only the current scene, its neighbours and the scenes in a running transition keep GPU memory.
+// Everything else is disposed and rebuilt by create() on demand (safe because update() is a pure function of s).
+function park() {
+  if (HEADLESS && !QS.has('park')) return;
+  const keep = new Set([cur - 1, cur, cur + 1]); if (trans) { keep.add(trans.from); keep.add(trans.to); }
+  slots.forEach((sl, i) => { if (!keep.has(i) && !sl.def.keep) sl.park(); });
+  const tk = new Set([slots[cur].def.enterWith, slots[cur + 1]?.def.enterWith, trans?.name, 'fade']);
+  for (const n in tInst) if (!tk.has(n)) { tInst[n].dispose && tInst[n].dispose(); delete tInst[n]; }
+}
+let cur = 0, trans = null, black = 0, blackTo = 0, auto = false, holdT = 0, clock = 0;
 const listeners = [];
 const emit = () => listeners.forEach(f => f());
 
 const deck = {
-  get info() { const sl = slots[cur]; return { i: cur, n: slots.length, id: sl.def.id, title: sl.def.title, beat: sl.s.beat,
-    notes: sl.def.beats[sl.s.beat].notes || '', hud: sl.def.hud || '#7f7f7f' }; },
+  get info() { const sl = slots[cur]; const b = sl.def.beats[sl.s.beat]; return { i: cur, n: slots.length, id: sl.def.id, title: sl.def.title,
+    beat: sl.s.beat, notes: b.notes || '', page: b.page ?? `${cur + 1} / ${slots.length}` }; },
+  list() { return slots.map(sl => ({ id: sl.def.id, title: sl.def.title, enterWith: sl.def.enterWith || 'fade',
+    beats: sl.def.beats.map(b => ({ dur: b.dur, delay: b.delay || 0 })) })); },
+  transitions() { return Object.fromEntries(Object.entries(TRANSITIONS).map(([k, v]) => [k, v.dur])); },
   go(to, { reverse = false, beat = 0, complete = false, via = null } = {}) {
     if (to < 0 || to >= slots.length) return;
     if (to === cur && !trans) { slots[cur].reset(beat, complete); emit(); return; }
-    const toS = slots[to].ensure(); toS.reset(beat, complete);
+    const toS = slots[to].ensure(); toS.reset(beat, complete); toS.s.enter = 0;
     const name = via || (reverse ? (slots[cur].def.enterWith || 'fade') : (toS.def.enterWith || 'fade'));
     const T = TRANSITIONS[name] || TRANSITIONS.fade;
     trans = { from: cur, to, name, p: 0, dur: T.dur * (reverse ? .6 : 1), reverse, speed: 1 };
     if (T.sound && audio[T.sound]) audio[T.sound](T.dur);
-    cur = to; holdT = 0; slots[Math.min(to + 1, slots.length - 1)].ensure();          // prewarm the next scene
-    emit();
+    cur = to; holdT = 0; slots[Math.min(to + 1, slots.length - 1)].ensure(); transition(name);   // prewarm
+    park(); emit();
   },
   advance() { audio.unlock(); if (trans) { trans.speed = 4; return; }
     const s = slots[cur].s; if (s.beat < s.n - 1) { s.beat++; audio.tick(); holdT = 0; emit(); } else deck.go(cur + 1); },
   back() { if (trans) return; const s = slots[cur].s;
     if (s.beat > 0) { s.beat--; emit(); } else if (cur > 0) { const prev = slots[cur - 1]; deck.go(cur - 1, { reverse: true, beat: prev.def.beats.length - 1, complete: true }); } },
-  jump(i, beat = 0) { if (typeof i === 'string') i = slots.findIndex(s => s.def.id === i); if (i < 0) return;
-    slots[i].ensure(); trans = null; cur = i; slots[i].reset(beat, beat > 0); emit(); },
+  // jump(i, beat, complete): complete=true lands on the finished state of that beat (used by verify + overview)
+  jump(i, beat = 0, complete = beat > 0) { if (typeof i === 'string') i = slots.findIndex(s => s.def.id === i); if (i < 0) return;
+    trans = null; cur = i; slots[i].ensure().reset(beat, complete); park(); emit(); },
   toggleBlack() { blackTo = blackTo ? 0 : 1; },
   setAuto(v) { auto = v; holdT = 0; }, get auto() { return auto; },
   on(f) { listeners.push(f); },
+  // Advance the simulation by `sec` seconds at a fixed 60 fps, then draw once. Deterministic: used with ?headless.
+  step(sec = 0, fps = 60) { const n = Math.max(1, Math.round(sec * fps)); for (let i = 0; i < n; i++) simulate(sec / n); draw(); },
   // Render any scene's final state to a dataURL (used by the overview grid).
   thumb(i, w = 480, h = 270) {
+    if (thumbs[i]) return thumbs[i];
     const sl = slots[i].ensure(); const save = { ...sl.s, p: [...sl.s.p], since: [...sl.s.since] };
-    const vs = { w: view.w, h: view.h, x0: view.x0, y0: view.y0, a: view.aspect };
     view.resize(w, h); sl.reset(sl.s.n - 1, true); sl.step(0);
     const rt = new THREE.WebGLRenderTarget(w, h); sl.render(rt, w / h);
     const buf = new Uint8Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf); rt.dispose();
-    Object.assign(sl.s, save); if (i === cur || (trans && trans.from === i)) sl.step(0);
-    view.resize(innerWidth, innerHeight);
+    Object.assign(sl.s, save); view.resize(innerWidth, innerHeight); if (i === cur || (trans && trans.from === i)) sl.step(0);
     const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'), img = g.createImageData(w, h);
     for (let y = 0; y < h; y++) img.data.set(buf.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);   // GL is bottom-up
-    g.putImageData(img, 0, 0); return c.toDataURL('image/jpeg', .8);
+    g.putImageData(img, 0, 0); return (thumbs[i] = c.toDataURL('image/jpeg', .8));
   },
 };
+const thumbs = {};
 
 function resize() {
   const W = innerWidth, H = innerHeight; renderer.setSize(W, H, false); view.resize(W, H);
   const v = new THREE.Vector2(); renderer.getDrawingBufferSize(v);
   for (const rt of [rtA, rtB, rtC]) rt.setSize(v.x, v.y);
 }
-addEventListener('resize', resize);
+addEventListener('resize', () => { resize(); if (HEADLESS) draw(); });
 
-let last = performance.now();
+function simulate(dt) {
+  clock += dt; black += (blackTo - black) * Math.min(1, dt * 8);
+  if (trans) {
+    trans.p += dt / trans.dur * trans.speed;
+    const A = slots[trans.from], B = slots[trans.to], pr = clamp(trans.p);
+    A.s.exit = pr; B.s.enter = pr;
+    A.step(dt); B.step(dt);
+    if (trans.p >= 1) { A.s.exit = 0; B.s.enter = 1; trans = null; park(); emit(); }
+  } else {
+    const S = slots[cur]; S.step(dt);
+    if (auto) { const s = S.s; if (s.p[s.beat] >= 1 && (holdT += dt) > (S.def.beats[s.beat].hold ?? 2)) deck.advance(); }
+  }
+}
+function draw() {
+  const aspect = innerWidth / innerHeight;
+  if (trans) {
+    const A = slots[trans.from], B = slots[trans.to], pr = clamp(trans.p);
+    A.render(rtA, aspect); B.render(rtB, aspect);
+    // reverse navigation plays the incoming transition backwards: swap inputs and run p from 1 to 0
+    transition(trans.name).render({ A: trans.reverse ? rtB : rtA, B: trans.reverse ? rtA : rtB, p: trans.reverse ? 1 - pr : pr,
+      out: rtC, aspect, time: clock });
+    post.u.tA.value = rtC.texture;
+  } else { slots[cur].render(rtA, aspect); post.u.tA.value = rtA.texture; }
+  post.u.uTime.value = clock; post.u.uBlack.value = black; post.render(null);
+  hudFrame();
+}
+let last = 0;
 function frame(now) {
   requestAnimationFrame(frame);
   const dt = Math.min(.05, (now - last) / 1000); last = now;       // clamp: a background tab must not teleport animations
-  const aspect = innerWidth / innerHeight;
-  black += (blackTo - black) * Math.min(1, dt * 8);
-  if (trans) {
-    trans.p += dt / trans.dur * trans.speed;
-    const A = slots[trans.from], B = slots[trans.to];
-    A.step(dt); B.step(dt);
-    A.render(rtA, aspect); B.render(rtB, aspect);
-    const tp = tpass(trans.name), pr = clamp(trans.p);
-    // reverse navigation plays the incoming transition backwards: swap inputs and run p from 1 to 0
-    tp.u.tA.value = trans.reverse ? rtB.texture : rtA.texture; tp.u.tB.value = trans.reverse ? rtA.texture : rtB.texture;
-    tp.u.p.value = trans.reverse ? 1 - pr : pr; tp.u.uAspect.value = aspect; tp.u.uTime.value = now / 1000;
-    tp.render(rtC); post.u.tA.value = rtC.texture;
-    if (trans.p >= 1) { trans = null; emit(); }
-  } else {
-    const S = slots[cur]; S.step(dt); S.render(rtA, aspect); post.u.tA.value = rtA.texture;
-    if (auto) { const s = S.s; if (s.p[s.beat] >= 1 && (holdT += dt) > (S.def.beats[s.beat].hold ?? 2)) deck.advance(); }
-  }
-  post.u.uTime.value = now / 1000; post.u.uBlack.value = black; post.render(null);
+  simulate(dt); draw();
 }
 
 /* ============================================================
-   8. UI: hud page number, notes, overview, help, toast, hash routing, keys
+   8. UI: hud page number, notes, overview, help, toast, hash routing, keys, touch
    ============================================================ */
 const ui = document.getElementById('ui');
 const el = (tag, cls, html = '') => { const e = document.createElement(tag); if (cls) e.className = cls; e.innerHTML = html; return e; };
 const hud = el('div', 'hud'); ui.append(hud);
-let notesEl = null, overEl = null, helpEl = null, notesWin = null, toastT;
-const toast = msg => { let t = ui.querySelector('.toast'); if (!t) ui.append(t = el('div', 'toast')); t.textContent = msg; t.style.opacity = 1;
-  clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 1400); };
+let notesEl = null, overEl = null, helpEl = null, notesWin = null, toastT, hudColor = '';
+function toast(msg) { let t = ui.querySelector('.toast'); if (!t) ui.append(t = el('div', 'toast')); t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 1400); }
+function hudFrame() {             // per frame, because hud colour may be a function of the scene state
+  const sl = slots[cur], h = sl.def.hud ?? '#7f7f7f', c = typeof h === 'function' ? h(sl.s) : h;
+  if (c !== hudColor) { hud.style.color = hudColor = c; }
+}
 function refresh() {
-  const f = deck.info; hud.textContent = `${f.i + 1} / ${f.n}`; hud.style.color = f.hud;
-  const h = `#${f.id}${f.beat ? '-' + (f.beat + 1) : ''}`; if (location.hash !== h) history.replaceState(null, '', h);
+  const f = deck.info; hud.textContent = f.page;
+  const h = `#${f.id}${f.beat ? '-' + (f.beat + 1) : ''}`; if (location.hash !== h) history.replaceState(null, '', location.pathname + location.search + h);
   const meta = `${f.i + 1}/${f.n} · ${f.title} · beat ${f.beat + 1}/${slots[f.i].s.n}`;
-  if (notesEl) notesEl.innerHTML = `<p>${f.notes}</p><span class="meta">${meta}</span>`;
-  if (notesWin && !notesWin.closed) { notesWin.document.getElementById('n').textContent = f.notes; notesWin.document.getElementById('m').textContent = meta; }
+  const next = slots[f.i].s.beat < slots[f.i].s.n - 1 ? 'next: beat ' + (f.beat + 2) : slots[f.i + 1] ? 'next: ' + slots[f.i + 1].def.title : 'end';
+  if (notesEl) notesEl.innerHTML = `<p></p><span class="meta"></span>`, notesEl.firstChild.textContent = f.notes, notesEl.lastChild.textContent = meta;
+  if (notesWin && !notesWin.closed) { const d = notesWin.document; d.getElementById('n').textContent = f.notes; d.getElementById('m').textContent = meta; d.getElementById('x').textContent = next; }
 }
 deck.on(refresh);
 function toggleNotes() {        // first try a separate presenter window (for a second screen); fall back to an inline bar
   if (notesEl) { notesEl.remove(); notesEl = null; return; }
   if (!notesWin || notesWin.closed) {
     try { notesWin = window.open('', 'deck-notes', 'width=760,height=480'); } catch { notesWin = null; }
-    if (notesWin) { notesWin.document.body.innerHTML = '<style>body{margin:0;background:#101218;color:#f2f4f8;font:28px/1.45 system-ui;padding:40px}#m{color:#a4abb8;font-size:20px;margin-top:24px}</style><div id="n"></div><div id="m"></div>';
-      notesWin.document.onkeydown = onKey; refresh(); return; }
+    if (notesWin) { notesWin.document.body.innerHTML = '<style>body{margin:0;background:#101218;color:#f2f4f8;font:28px/1.45 system-ui;padding:40px;display:grid;gap:24px}#m,#x,#c{color:#a4abb8;font-size:20px;font-variant-numeric:tabular-nums}</style><div id="c"></div><div id="n"></div><div id="x"></div><div id="m"></div>';
+      notesWin.document.onkeydown = onKey; const t0 = Date.now();
+      const tick = () => { if (notesWin.closed) return; const s = (Date.now() - t0) / 1000 | 0; notesWin.document.getElementById('c').textContent = `${(s / 60) | 0}:${String(s % 60).padStart(2, '0')} elapsed`; setTimeout(tick, 1000); };
+      tick(); refresh(); return; }
   }
   notesEl = el('div', 'notes'); ui.append(notesEl); refresh();
 }
 function toggleOverview() {
-  if (overEl) { overEl.remove(); overEl = null; canvas.focus(); return; }
+  if (overEl) { overEl.remove(); overEl = null; park(); canvas.focus(); return; }
   overEl = el('div', 'over'); ui.append(overEl);
-  slots.forEach((sl, i) => { const b = el('button', '', `<div class="th"></div><span>${i + 1}. ${sl.def.title}</span>`);
+  slots.forEach((sl, i) => { const b = el('button', '', `<div class="th"></div><span></span>`); b.lastChild.textContent = `${i + 1}. ${sl.def.title}`;
     b.setAttribute('aria-current', i === cur); b.onclick = () => { deck.jump(i); toggleOverview(); }; overEl.append(b);
-    requestAnimationFrame(() => { b.querySelector('.th').style.backgroundImage = `url(${deck.thumb(i)})`; }); });
+    setTimeout(() => { if (overEl) b.firstChild.style.backgroundImage = `url(${deck.thumb(i)})`; }, 30 * i); });
   overEl.querySelector('[aria-current=true]')?.focus();
 }
 function toggleHelp() {
@@ -498,8 +779,8 @@ function toggleHelp() {
 }
 function onKey(e) {
   if (e.metaKey || e.ctrlKey || e.altKey) return; const k = e.key; audio.unlock();
-  if (overEl && !['Escape', 'o', 'O', 'Enter', ' '].includes(k)) return;
-  if (['ArrowRight', 'ArrowDown', ' ', 'PageDown', 'Enter'].includes(k)) { if (overEl) return; e.preventDefault(); if (!e.repeat) deck.advance(); }
+  if (overEl && !['Escape', 'o', 'O'].includes(k)) return;
+  if (['ArrowRight', 'ArrowDown', ' ', 'PageDown', 'Enter'].includes(k)) { e.preventDefault(); if (!e.repeat) deck.advance(); }
   else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace'].includes(k)) { e.preventDefault(); if (!e.repeat) deck.back(); }
   else if (k === 'Home') deck.jump(0); else if (k === 'End') deck.jump(slots.length - 1);
   else if (k === 'f' || k === 'F') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
@@ -510,8 +791,12 @@ function onKey(e) {
   else if (k === 'Escape') { if (overEl) toggleOverview(); if (helpEl) toggleHelp(); }
 }
 addEventListener('keydown', onKey);
-// click / tap: right two-thirds = next, left third = back
-canvas.addEventListener('pointerup', e => { audio.unlock(); (e.clientX < innerWidth / 3 ? deck.back : deck.advance)(); });
+// pointer: tap right two-thirds = next, left third = back; horizontal swipe also works
+let down = null;
+canvas.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; });
+canvas.addEventListener('pointerup', e => { audio.unlock(); if (!down) return; const dx = e.clientX - down.x, dy = e.clientY - down.y; down = null;
+  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) (dx < 0 ? deck.advance : deck.back)();
+  else if (Math.hypot(dx, dy) < 10) (e.clientX < innerWidth / 3 ? deck.back : deck.advance)(); });
 let idleT; const wake = () => { document.body.classList.remove('idle'); clearTimeout(idleT); idleT = setTimeout(() => document.body.classList.add('idle'), 2200); };
 addEventListener('pointermove', wake); wake();
 const fromHash = () => { const m = /^#([a-z0-9-]+?)(?:-(\d+))?$/.exec(location.hash); if (!m) return null;
@@ -522,13 +807,15 @@ addEventListener('hashchange', () => { const h = fromHash(); if (h && (h[0] !== 
    9. BOOT: wait for fonts (text is rasterised once), build first scene, start
    ============================================================ */
 (async () => {
-  try { await Promise.race([Promise.all(['400 40px Newsreader', 'italic 300 40px Newsreader', '500 40px "Geist Mono"', '40px Anton'].map(f => document.fonts.load(f))), new Promise(r => setTimeout(r, 2500))]); } catch {}
-  resize();
-  const h = fromHash() || [0, 0];
-  slots[h[0]].ensure(); deck.jump(h[0], h[1]);
-  ui.querySelector('.load').remove(); canvas.focus();
-  window.deck = deck;                      // handy for debugging + automated screenshots
-  requestAnimationFrame(t => { last = t; frame(t); });
+  try {
+    try { await Promise.race([Promise.all(['400 40px Newsreader', 'italic 300 40px Newsreader', '500 40px "Geist Mono"', '40px Anton'].map(f => document.fonts.load(f))), new Promise(r => setTimeout(r, 2500))]); } catch {}
+    resize();
+    const h = fromHash() || [0, 0];
+    deck.jump(h[0], h[1]);
+    ui.querySelector('.load')?.remove(); canvas.focus();
+    window.deck = deck; window.__deckBooted = true;       // deck is the automation / debugging handle
+    if (HEADLESS) deck.step(0); else requestAnimationFrame(t => { last = t; frame(t); });
+  } catch (e) { console.error(e); fail('The presentation crashed while starting.', String(e && e.message || e)); }
 })();
 </script>
 </body>
