@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebGL Deck</title>
+<!-- Fonts: for a fully offline single file, replace this link with base64 @font-face / FontFace (see references/architecture.md §7) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300..700;1,6..72,300..700&family=Geist+Mono:wght@400;500&family=Anton&display=swap">
+<style>
+/* One full-window picture. The only chrome is what the presenter asks for. */
+:root{--bg:#ffffff;--panel:rgba(16,18,24,.92);--text:#f2f4f8;--dim:#a4abb8;--sel:#5b8cff}
+html,body{height:100%}
+body{margin:0;overflow:hidden;background:var(--bg);color:var(--text);font:15px/1.5 "Geist Mono",ui-monospace,monospace}
+#stage{position:fixed;inset:0;width:100%;height:100%;display:block;outline:none;touch-action:none}
+#ui{position:fixed;inset:0;pointer-events:none}
+#ui>*{pointer-events:auto}
+body.idle{cursor:none}
+.hud{position:absolute;right:28px;bottom:20px;font-size:14px;letter-spacing:.04em;pointer-events:none!important;transition:color .4s}
+.notes{position:absolute;left:0;right:0;bottom:0;padding:18px 24px;background:var(--panel);display:flex;gap:24px;justify-content:space-between}
+.notes p{margin:0;max-width:70ch;font-size:18px;white-space:pre-line}
+.notes .meta{color:var(--dim);white-space:nowrap}
+.over{position:absolute;inset:0;background:rgba(12,13,17,.96);overflow:auto;padding:40px;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:24px;align-content:start}
+.over button{all:unset;cursor:pointer;display:grid;gap:8px}
+.over .th{aspect-ratio:16/9;background:#222 center/cover;outline:2px solid transparent;outline-offset:3px;border-radius:4px}
+.over button:hover .th,.over button:focus-visible .th,.over button[aria-current=true] .th{outline-color:var(--sel)}
+.over span{color:var(--dim);font-size:14px}
+.help{position:absolute;right:24px;bottom:56px;background:var(--panel);padding:18px 22px;display:grid;grid-template-columns:auto auto;gap:6px 18px;border-radius:8px}
+.help b{font-weight:500}.help span{color:var(--dim)}
+.toast{position:absolute;left:50%;bottom:34px;transform:translateX(-50%);background:var(--panel);padding:8px 14px;border-radius:6px;transition:opacity .3s}
+.load{position:absolute;inset:0;background:#fff;color:#404040;display:grid;place-content:center}
+@media (max-width:600px){.over{padding:16px;grid-template-columns:1fr 1fr;gap:12px}.help{left:16px;right:16px}}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+</head>
+<body>
+<canvas id="stage" tabindex="0" aria-label="The presentation"></canvas>
+<div id="ui"><div class="load">Loading…</div></div>
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   0. MATH + EASING  (scenes animate with these, never with CSS)
+   ============================================================ */
+const clamp = (x, a = 0, b = 1) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = {
+  linear: t => t,
+  out3: t => 1 - Math.pow(1 - t, 3),
+  out4: t => 1 - Math.pow(1 - t, 4),
+  io3: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outBack: t => { const c = 1.7; return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); },
+};
+const rng = seed => { let s = (seed * 2654435761) >>> 0 || 1; return () => (s ^= s << 13, s >>>= 0, s ^= s >>> 17, s ^= s << 5, s >>>= 0, s / 4294967296); };
+
+/* ============================================================
+   1. GFX: renderer, virtual 1920x1080 view, render targets, passes
+   ============================================================ */
+THREE.ColorManagement.enabled = false;              // hex in = pixels out. No colour-space surprises.
+const canvas = document.getElementById('stage');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: false });
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+
+// Virtual stage: everything is authored in a 1920x1080 box (y down). The box is fitted
+// inside the window; the camera extends past it so wide/tall screens get bleed, never bars.
+const view = (() => {
+  const cam = new THREE.OrthographicCamera(0, 1920, 0, 1080, -1000, 1000);
+  const v = { cam, w: 1920, h: 1080, x0: 0, y0: 0, aspect: 16 / 9,
+    resize(W, H) {
+      const k = Math.min(W / 1920, H / 1080);
+      v.w = W / k; v.h = H / k; v.x0 = (1920 - v.w) / 2; v.y0 = (1080 - v.h) / 2; v.aspect = W / H;
+      cam.left = v.x0; cam.right = v.x0 + v.w; cam.top = v.y0; cam.bottom = v.y0 + v.h;
+      cam.updateProjectionMatrix();
+    } };
+  return v;
+})();
+
+const target = (w = 1, h = 1) => new THREE.WebGLRenderTarget(w, h, { depthBuffer: true, samples: 4 });
+const rtA = target(), rtB = target(), rtC = target();
+const quadGeo = new THREE.PlaneGeometry(2, 2);
+const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`;
+// Shared GLSL helpers available to every pass (transitions + post)
+const GLSL_LIB = `
+varying vec2 vUv;
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f*f*(3.-2.*f);
+  return mix(mix(hash12(i), hash12(i+vec2(1,0)), f.x), mix(hash12(i+vec2(0,1)), hash12(i+vec2(1,1)), f.x), f.y); }
+float fbm(vec2 p){ float s = 0., a = .5; for(int i=0;i<5;i++){ s += a*vnoise(p); p *= 2.03; a *= .5; } return s; }
+float luma(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
+`;
+function pass(frag, uniforms = {}) {
+  const mat = new THREE.ShaderMaterial({ vertexShader: VERT, fragmentShader: GLSL_LIB + frag, uniforms: {
+    tA: { value: null }, tB: { value: null }, p: { value: 0 }, uAspect: { value: 16 / 9 }, uTime: { value: 0 },
+    ...Object.fromEntries(Object.entries(uniforms).map(([k, v]) => [k, { value: v }])) }, depthTest: false, depthWrite: false });
+  const mesh = new THREE.Mesh(quadGeo, mat); const sc = new THREE.Scene(); sc.add(mesh); mesh.frustumCulled = false;
+  return { u: mat.uniforms, render(out) { renderer.setRenderTarget(out || null); renderer.render(sc, quadCam); } };
+}
+
+/* ============================================================
+   2. TEXT: Canvas2D-rasterised text blocks as textured planes
+      (advanced: per-glyph instanced quads -> references/architecture.md §4)
+   ============================================================ */
+const FONTS = { display: '400 {s}px Newsreader, Georgia, serif', italic: 'italic 300 {s}px Newsreader, Georgia, serif',
+  mono: '500 {s}px "Geist Mono", monospace', poster: '400 {s}px Anton, Impact, sans-serif' };
+function text(str, o = {}) {
+  o = { x: 0, y: 0, size: 64, font: 'display', color: '#111', align: 'left', valign: 'top', leading: 1.15, tracking: 0, maxWidth: 0, ...o };
+  const RES = 2;                                       // raster at 2x virtual px so it stays crisp on 4K
+  const c = document.createElement('canvas'), g = c.getContext('2d');
+  const font = FONTS[o.font].replace('{s}', o.size * RES);
+  g.font = font; if ('letterSpacing' in g) g.letterSpacing = (o.tracking * o.size * RES) + 'px';
+  // word wrap
+  const lines = [];
+  for (const para of String(str).split('\n')) {
+    if (!o.maxWidth) { lines.push(para); continue; }
+    let cur = '';
+    for (const w of para.split(' ')) { const t = cur ? cur + ' ' + w : w;
+      if (g.measureText(t).width > o.maxWidth * RES && cur) { lines.push(cur); cur = w; } else cur = t; }
+    lines.push(cur);
+  }
+  const lh = o.size * o.leading * RES, pad = o.size * .4 * RES;
+  const tw = Math.max(1, ...lines.map(l => g.measureText(l).width));
+  c.width = Math.ceil(tw + pad * 2); c.height = Math.ceil(lh * lines.length + pad * 2);
+  g.font = font; if ('letterSpacing' in g) g.letterSpacing = (o.tracking * o.size * RES) + 'px';
+  g.fillStyle = o.color; g.textBaseline = 'middle';
+  g.textAlign = o.align;
+  const ax = o.align === 'center' ? c.width / 2 : o.align === 'right' ? c.width - pad : pad;
+  lines.forEach((l, i) => g.fillText(l, ax, pad + lh * (i + .5)));
+  const tex = new THREE.CanvasTexture(c); tex.flipY = false; tex.anisotropy = 4;   // flipY off because the view is y-down
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false, side: THREE.DoubleSide });
+  const W = c.width / RES, H = c.height / RES;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(W, H), mat); mesh.renderOrder = 10;
+  const ox = o.align === 'center' ? 0 : o.align === 'right' ? -W / 2 + pad / RES : W / 2 - pad / RES;
+  const oy = o.valign === 'middle' ? 0 : o.valign === 'bottom' ? -H / 2 + pad / RES : H / 2 - pad / RES;
+  mesh.userData.home = new THREE.Vector2(o.x + ox, o.y + oy);
+  mesh.position.set(o.x + ox, o.y + oy, 0);
+  // convenience: set alpha / offset in one call each frame
+  mesh.pose = (alpha = 1, dx = 0, dy = 0, s = 1, rot = 0) => {
+    mat.opacity = alpha; mesh.visible = alpha > .001;
+    mesh.position.set(mesh.userData.home.x + dx, mesh.userData.home.y + dy, 0); mesh.scale.setScalar(s); mesh.rotation.z = rot;
+  };
+  return mesh;
+}
+const rect = (x, y, w, h, color) => {               // top-left anchored box in virtual px
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color, transparent: true, side: THREE.DoubleSide }));
+  m.set = (X, Y, W, H) => { m.position.set(X + W / 2, Y + H / 2, 0); m.scale.set(Math.max(W, 1e-3), Math.max(H, 1e-3), 1); };
+  m.set(x, y, w, h); return m;
+};
+
+/* ============================================================
+   3. AUDIO: tiny procedural Web Audio (no files). Unlocked on first key.
+   ============================================================ */
+const audio = (() => {
+  let ac = null, master = null, muted = false;
+  const unlock = () => { if (ac) return; const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    ac = new AC(); master = ac.createGain(); master.gain.value = .5; master.connect(ac.destination); };
+  const noise = (dur) => { const b = ac.createBuffer(1, ac.sampleRate * dur, ac.sampleRate), d = b.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1; const s = ac.createBufferSource(); s.buffer = b; return s; };
+  return {
+    unlock, get muted() { return muted; }, mute() { muted = !muted; if (master) master.gain.value = muted ? 0 : .5; },
+    whoosh(dur = .8, f0 = 200, f1 = 2400) { if (!ac || muted) return; const t = ac.currentTime, n = noise(dur),
+      f = ac.createBiquadFilter(), g = ac.createGain(); f.type = 'bandpass'; f.Q.value = .9;
+      f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + dur * .6);
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(.5, t + dur * .35); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+      n.connect(f).connect(g).connect(master); n.start(t); n.stop(t + dur); },
+    tick(freq = 1200) { if (!ac || muted) return; const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.setValueAtTime(freq, t); o.frequency.exponentialRampToValueAtTime(freq * .5, t + .08);
+      g.gain.setValueAtTime(.18, t); g.gain.exponentialRampToValueAtTime(.001, t + .1); o.connect(g).connect(master); o.start(t); o.stop(t + .12); },
+    thud() { if (!ac || muted) return; const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'sine'; o.frequency.setValueAtTime(140, t); o.frequency.exponentialRampToValueAtTime(40, t + .25);
+      g.gain.setValueAtTime(.6, t); g.gain.exponentialRampToValueAtTime(.001, t + .35); o.connect(g).connect(master); o.start(t); o.stop(t + .4); },
+  };
+})();
+
+/* ============================================================
+   4. TRANSITIONS: each one is { dur, sound, frag }.
+      frag gets: tA (outgoing frame), tB (incoming frame), p (0..1), uAspect, uTime.
+   ============================================================ */
+const TRANSITIONS = {
+  fade: { dur: .7, sound: null, frag: `uniform sampler2D tA,tB; uniform float p;
+    void main(){ gl_FragColor = mix(texture2D(tA,vUv), texture2D(tB,vUv), smoothstep(0.,1.,p)); }` },
+
+  // A glowing scan line sweeps across; behind it the new slide.
+  line: { dur: 1.1, sound: 'tick', frag: `uniform sampler2D tA,tB; uniform float p;
+    void main(){ float e = mix(-.05, 1.05, smoothstep(0.,1.,p));
+      float wob = .012*sin(vUv.y*24. + p*9.);
+      float x = vUv.x + wob;
+      vec3 c = x < e ? texture2D(tB,vUv).rgb : texture2D(tA,vUv).rgb;
+      float glow = exp(-abs(x-e)*140.) * sin(3.14159*clamp(p,0.,1.));
+      gl_FragColor = vec4(c + vec3(1.,.95,.8)*glow*1.4, 1.); }` },
+
+  // B slams in from huge scale, then the frame shakes on impact.
+  slam: { dur: .9, sound: 'thud', frag: `uniform sampler2D tA,tB; uniform float p;
+    void main(){ float k = clamp(p/.45, 0., 1.);
+      float s = mix(3.2, 1., k*k*k);
+      float hit = clamp((p-.45)/.55, 0., 1.);
+      vec2 shake = (1.-hit)*(1.-hit)*.025*vec2(sin(p*97.), cos(p*83.)) * step(.45,p);
+      vec2 ub = (vUv-.5)/s + .5 + shake;
+      vec3 a = texture2D(tA, (vUv-.5)*(1.-.08*k)+.5).rgb * (1.-.7*k);
+      bool inB = all(greaterThanEqual(ub, vec2(0.))) && all(lessThanEqual(ub, vec2(1.)));
+      vec3 b = texture2D(tB, ub).rgb;
+      float alpha = smoothstep(0., .15, k);
+      gl_FragColor = vec4(inB ? mix(a, b, alpha) : a, 1.); }` },
+
+  // A folds over like a page turned right-to-left; the back of the page is shaded paper.
+  fold: { dur: 1.3, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p;
+    void main(){ float f = 1. - smoothstep(0.,1.,p);          // fold line x
+      float x = vUv.x; vec3 c;
+      if (x > f) {                                              // uncovered: new slide, shadowed near the crease
+        c = texture2D(tB, vUv).rgb * (1. - .45*exp(-(x-f)*18.)*step(.001,f));
+      } else if (x > 2.*f - 1.) {                               // the folded flap (back of page A)
+        vec2 m = vec2(2.*f - x, vUv.y);
+        vec3 a = texture2D(tA, m).rgb;
+        float shade = .55 + .45*clamp((x-(2.*f-1.))/(1.-f+1e-4), 0., 1.);
+        c = mix(vec3(.93,.91,.87), a, .18) * shade;             // paper back, faint show-through
+      } else {
+        c = texture2D(tA, vUv).rgb * (1. - .35*exp(-((2.*f-1.)-x)*25.)); // flat part of A, shadow under flap
+      }
+      gl_FragColor = vec4(c, 1.); }` },
+
+  // A rips down a ragged vertical line; both halves pull apart with a fibrous paper edge.
+  tear: { dur: 1.4, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p; uniform float uAspect;
+    float edge(float y){ return .5 + .05*(fbm(vec2(y*6., 1.7))-.5)*2. + .012*(vnoise(vec2(y*90., 3.))-.5); }
+    void main(){ float k = smoothstep(0.,1.,p); float d = k*.62;
+      vec2 uv = vUv;
+      vec2 L = vec2(uv.x + d, uv.y + k*.04*(uv.x)), R = vec2(uv.x - d, uv.y - k*.03*(1.-uv.x));
+      float eL = edge(L.y), eR = edge(R.y);
+      vec3 c = texture2D(tB, uv).rgb;
+      float fib = .004 + .004*vnoise(vec2(uv.y*400., 0.));
+      if (L.x < eL) c = (L.x > eL - fib) ? vec3(.97,.95,.9) : texture2D(tA, L).rgb;
+      else if (R.x > eR) c = (R.x < eR + fib) ? vec3(.97,.95,.9) : texture2D(tA, R).rgb;
+      else c *= 1. - .35*(1.-k);                                 // the gap starts in shadow
+      gl_FragColor = vec4(c, 1.); }` },
+
+  // Circular portal opens from the centre; content is lens-distorted around the rim.
+  'portal-in': { dur: 1.2, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p; uniform float uAspect;
+    void main(){ vec2 q = (vUv-.5)*vec2(uAspect,1.); float r = length(q);
+      float R = smoothstep(0.,1.,p) * (length(vec2(uAspect,1.))*.5 + .1);
+      float w = .08;
+      vec2 dir = r > 0. ? q/r : vec2(0.);
+      float bend = exp(-pow((r-R)/w, 2.));
+      vec2 ua = vUv - dir/vec2(uAspect,1.)*bend*.05*(1.-p);
+      vec2 ub = (vUv-.5)*mix(1.35, 1., p) + .5 + dir/vec2(uAspect,1.)*bend*.04;
+      vec3 c = r < R ? texture2D(tB, ub).rgb : texture2D(tA, ua).rgb * (1.-.5*p);
+      c += vec3(.6,.75,1.)*bend*.6*sin(3.14159*p);
+      gl_FragColor = vec4(c, 1.); }` },
+
+  // Reverse: A collapses into a shrinking circle over B.
+  'portal-out': { dur: 1.1, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p; uniform float uAspect;
+    void main(){ vec2 q = (vUv-.5)*vec2(uAspect,1.); float r = length(q);
+      float R = (1.-smoothstep(0.,1.,p)) * (length(vec2(uAspect,1.))*.5 + .1);
+      float bend = exp(-pow((r-R)/.07, 2.));
+      vec2 ua = (vUv-.5)*mix(1., .6, p) + .5;
+      vec3 c = r < R ? texture2D(tA, ua).rgb : texture2D(tB, (vUv-.5)*mix(1.25,1.,p)+.5).rgb;
+      c += vec3(1.)*bend*.5*sin(3.14159*p);
+      gl_FragColor = vec4(c, 1.); }` },
+
+  // Light rises from the bottom: bright areas of A burn through first, warm glow at the front.
+  daybreak: { dur: 1.6, sound: 'whoosh', frag: `uniform sampler2D tA,tB; uniform float p;
+    void main(){ vec3 a = texture2D(tA,vUv).rgb, b = texture2D(tB,vUv).rgb;
+      float field = (1.-vUv.y)*.7 + luma(a)*.2 + fbm(vUv*5.)*.25;
+      float th = mix(-.1, 1.25, p);
+      float m = smoothstep(th, th-.12, field);
+      float front = exp(-pow((field-th)/.06, 2.)) * sin(3.14159*p);
+      vec3 c = mix(a, b, m) + vec3(1.,.62,.25)*front*1.2;
+      gl_FragColor = vec4(c, 1.); }` },
+};
+
+/* ============================================================
+   5. POST: one final pass. Vignette + film grain + blackout. Keep it subtle.
+   ============================================================ */
+const post = pass(`uniform sampler2D tA; uniform float uTime, uBlack, uVig, uGrain;
+  void main(){ vec3 c = texture2D(tA, vUv).rgb;
+    vec2 q = vUv-.5; c *= 1. - uVig*dot(q,q)*1.6;
+    c += (hash12(gl_FragCoord.xy + fract(uTime)*100.)-.5)*uGrain;
+    gl_FragColor = vec4(c*(1.-uBlack), 1.); }`, { uBlack: 0, uVig: .25, uGrain: .035 });
+
+/* ============================================================
+   6. SCENES  (the content). One object per scene. See SKILL.md for the contract.
+      s.p[i]      progress 0..1 of beat i (beats play in order, one per keypress)
+      s.k(i,a,b)  eased 0..1 over seconds a..b inside beat i
+      s.t         seconds since the scene was entered
+   ============================================================ */
+const SCENES = [
+  {
+    id: 'title', title: 'Title', enterWith: 'fade', hud: '#7f7f7f',
+    beats: [{ dur: 2.2, notes: 'Open on a quiet title. Let it breathe.' },
+            { dur: 1.6, notes: 'The subtitle lands. Then move on.' }],
+    create(ctx) {
+      const scene = new THREE.Scene(); scene.background = new THREE.Color('#f4efe6');
+      const h = ctx.text('The Last\nBoring Slide', { x: 140, y: 380, size: 170, font: 'display', color: '#14161c', leading: 1.0, valign: 'middle' });
+      const sub = ctx.text('a deck that moves like an idea', { x: 146, y: 640, size: 46, font: 'italic', color: '#8a5a2b' });
+      const bar = ctx.rect(146, 720, 0, 6, '#14161c');
+      scene.add(h, sub, bar);
+      return { scene, update(s) {
+        const a = s.k(0, 0, 1.4, ease.out4);
+        h.pose(a, 0, (1 - a) * 60);
+        const b = s.k(1, 0, 1.0, ease.out3);
+        sub.pose(b, (1 - b) * -40, 0); bar.set(146, 720, 520 * s.k(1, .2, 1.4, ease.io3), 6);
+      } };
+    },
+  },
+  {
+    id: 'growth', title: 'Bars', enterWith: 'line', hud: '#ffffff',
+    beats: [{ dur: 1.5, notes: 'Start with the baseline.' },
+            { dur: 2.5, notes: 'Each year doubles. Watch the last bar.' },
+            { dur: 1.5, notes: 'The punchline in one number.' }],
+    create(ctx) {
+      const scene = new THREE.Scene(); scene.background = new THREE.Color('#121a2b');
+      const vals = [1, 2, 4, 8, 16, 32], bars = vals.map(() => ctx.rect(0, 0, 0, 0, '#5b8cff'));
+      const title = ctx.text('Doubling is not linear.', { x: 120, y: 110, size: 78, color: '#ffffff' });
+      const big = ctx.text('32×', { x: 1180, y: 300, size: 220, font: 'poster', color: '#ffd21f', align: 'right', valign: 'middle' });
+      scene.add(title, big, ...bars);
+      return { scene, update(s) {
+        title.pose(s.k(0, 0, 1, ease.out4));
+        vals.forEach((v, i) => {
+          const g = i === 0 ? s.k(0, .2, 1.2, ease.out3) : s.k(1, i * .3, i * .3 + .9, ease.outBack);
+          const h = 700 * v / 32 * g, x = 160 + i * 250;
+          bars[i].set(x, 940 - h, 170, h);
+          bars[i].material.color.set(i === vals.length - 1 && s.p[2] > 0 ? '#ffd21f' : '#5b8cff');
+        });
+        const k = s.k(2, 0, .8, ease.outBack); big.pose(k, 0, 0, .6 + .4 * k);
+      } };
+    },
+  },
+  {
+    id: 'orbit', title: '3D', enterWith: 'portal-in', hud: '#ffffff',
+    beats: [{ dur: 3, notes: 'A real 3D scene: own camera, lights, geometry.' },
+            { dur: 2, notes: 'Second beat pulls the camera in.' }],
+    create(ctx) {
+      const scene = new THREE.Scene(); scene.background = new THREE.Color('#0b0b10');
+      const camera = new THREE.PerspectiveCamera(35, 16 / 9, .1, 100);
+      const knot = new THREE.Mesh(new THREE.TorusKnotGeometry(1, .32, 220, 32),
+        new THREE.MeshStandardMaterial({ color: '#ff6a3d', roughness: .35, metalness: .2 }));
+      scene.add(knot, new THREE.AmbientLight('#556', 1.2));
+      const l = new THREE.DirectionalLight('#fff', 3); l.position.set(3, 4, 5); scene.add(l);
+      // 2D overlay layer drawn on top with the shared ortho camera
+      const overlay = new THREE.Scene(); const cap = ctx.text('Geometry, not pictures.', { x: 120, y: 940, size: 64, color: '#fff', valign: 'bottom' }); overlay.add(cap);
+      return { scene, camera, overlay, update(s) {
+        knot.rotation.set(s.t * .4, s.t * .6, 0);
+        knot.scale.setScalar(ease.out4(s.k(0, 0, 1.6)) + 1e-3);
+        camera.position.set(0, 0, lerp(9, 5.2, s.k(1, 0, 2, ease.io3))); camera.lookAt(0, 0, 0);
+        cap.pose(s.k(0, .8, 2, ease.out3));
+      } };
+    },
+  },
+  {
+    id: 'questions', title: 'Questions', enterWith: 'daybreak', hud: '#7f7f7f',
+    beats: [{ dur: 1.4, notes: 'Thank them. Stop talking.' }],
+    create(ctx) {
+      const scene = new THREE.Scene(); scene.background = new THREE.Color('#ffffff');
+      const q = ctx.text('Any questions?', { x: 960, y: 540, size: 140, color: '#14161c', align: 'center', valign: 'middle' });
+      scene.add(q);
+      return { scene, update(s) { const a = s.k(0, 0, 1.2, ease.out4); q.pose(a, 0, 0, .94 + .06 * a); } };
+    },
+  },
+];
+
+/* ============================================================
+   7. ENGINE: scene state, beats, transitions, render loop
+   ============================================================ */
+const ctx = { THREE, view, text, rect, audio, ease, clamp, lerp, rng };
+class Slot {
+  constructor(def, i) { this.def = def; this.i = i; this.inst = null; const n = def.beats.length;
+    this.s = { t: 0, beat: 0, n, p: new Array(n).fill(0), since: new Array(n).fill(0),
+      at: i => this.s.p[i] * def.beats[i].dur,
+      k: (i, a, b, e = ease.linear) => e(clamp((this.s.p[i] * def.beats[i].dur - a) / Math.max(1e-4, b - a))) }; }
+  ensure() { if (!this.inst) this.inst = this.def.create(ctx); return this; }
+  reset(beat = 0, complete = false) { const s = this.s; s.t = complete ? 30 : 0; s.beat = beat;
+    for (let i = 0; i < s.n; i++) { s.p[i] = complete && i <= beat ? 1 : 0; s.since[i] = 0; } }
+  step(dt) { const s = this.s, B = this.def.beats; s.t += dt;
+    for (let i = 0; i < s.n; i++) {
+      if (i <= s.beat) { s.since[i] += dt; if (s.since[i] >= (B[i].delay || 0)) s.p[i] = Math.min(1, s.p[i] + dt / B[i].dur * (i < s.beat ? 3 : 1)); }
+      else { s.since[i] = 0; s.p[i] = Math.max(0, s.p[i] - dt / B[i].dur * 2.4); }   // rewinding a beat runs fast backwards
+    }
+    this.inst.update(s); }
+  render(out, aspect) { const { scene, camera, overlay } = this.inst; const cam = camera || view.cam;
+    if (cam.isPerspectiveCamera && cam.aspect !== aspect) { cam.aspect = aspect; cam.updateProjectionMatrix(); }
+    renderer.setRenderTarget(out); renderer.render(scene, cam);
+    if (overlay) { renderer.autoClear = false; renderer.render(overlay, view.cam); renderer.autoClear = true; } }
+}
+const slots = SCENES.map((d, i) => new Slot(d, i));
+const passes = {};
+const tpass = name => passes[name] || (passes[name] = pass(TRANSITIONS[name].frag));
+let cur = 0, trans = null, black = 0, blackTo = 0, auto = false, holdT = 0;
+const listeners = [];
+const emit = () => listeners.forEach(f => f());
+
+const deck = {
+  get info() { const sl = slots[cur]; return { i: cur, n: slots.length, id: sl.def.id, title: sl.def.title, beat: sl.s.beat,
+    notes: sl.def.beats[sl.s.beat].notes || '', hud: sl.def.hud || '#7f7f7f' }; },
+  go(to, { reverse = false, beat = 0, complete = false, via = null } = {}) {
+    if (to < 0 || to >= slots.length) return;
+    if (to === cur && !trans) { slots[cur].reset(beat, complete); emit(); return; }
+    const toS = slots[to].ensure(); toS.reset(beat, complete);
+    const name = via || (reverse ? (slots[cur].def.enterWith || 'fade') : (toS.def.enterWith || 'fade'));
+    const T = TRANSITIONS[name] || TRANSITIONS.fade;
+    trans = { from: cur, to, name, p: 0, dur: T.dur * (reverse ? .6 : 1), reverse, speed: 1 };
+    if (T.sound && audio[T.sound]) audio[T.sound](T.dur);
+    cur = to; holdT = 0; slots[Math.min(to + 1, slots.length - 1)].ensure();          // prewarm the next scene
+    emit();
+  },
+  advance() { audio.unlock(); if (trans) { trans.speed = 4; return; }
+    const s = slots[cur].s; if (s.beat < s.n - 1) { s.beat++; audio.tick(); holdT = 0; emit(); } else deck.go(cur + 1); },
+  back() { if (trans) return; const s = slots[cur].s;
+    if (s.beat > 0) { s.beat--; emit(); } else if (cur > 0) { const prev = slots[cur - 1]; deck.go(cur - 1, { reverse: true, beat: prev.def.beats.length - 1, complete: true }); } },
+  jump(i, beat = 0) { if (typeof i === 'string') i = slots.findIndex(s => s.def.id === i); if (i < 0) return;
+    slots[i].ensure(); trans = null; cur = i; slots[i].reset(beat, beat > 0); emit(); },
+  toggleBlack() { blackTo = blackTo ? 0 : 1; },
+  setAuto(v) { auto = v; holdT = 0; }, get auto() { return auto; },
+  on(f) { listeners.push(f); },
+  // Render any scene's final state to a dataURL (used by the overview grid).
+  thumb(i, w = 480, h = 270) {
+    const sl = slots[i].ensure(); const save = { ...sl.s, p: [...sl.s.p], since: [...sl.s.since] };
+    const vs = { w: view.w, h: view.h, x0: view.x0, y0: view.y0, a: view.aspect };
+    view.resize(w, h); sl.reset(sl.s.n - 1, true); sl.step(0);
+    const rt = new THREE.WebGLRenderTarget(w, h); sl.render(rt, w / h);
+    const buf = new Uint8Array(w * h * 4); renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf); rt.dispose();
+    Object.assign(sl.s, save); if (i === cur || (trans && trans.from === i)) sl.step(0);
+    view.resize(innerWidth, innerHeight);
+    const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'), img = g.createImageData(w, h);
+    for (let y = 0; y < h; y++) img.data.set(buf.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);   // GL is bottom-up
+    g.putImageData(img, 0, 0); return c.toDataURL('image/jpeg', .8);
+  },
+};
+
+function resize() {
+  const W = innerWidth, H = innerHeight; renderer.setSize(W, H, false); view.resize(W, H);
+  const v = new THREE.Vector2(); renderer.getDrawingBufferSize(v);
+  for (const rt of [rtA, rtB, rtC]) rt.setSize(v.x, v.y);
+}
+addEventListener('resize', resize);
+
+let last = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(.05, (now - last) / 1000); last = now;       // clamp: a background tab must not teleport animations
+  const aspect = innerWidth / innerHeight;
+  black += (blackTo - black) * Math.min(1, dt * 8);
+  if (trans) {
+    trans.p += dt / trans.dur * trans.speed;
+    const A = slots[trans.from], B = slots[trans.to];
+    A.step(dt); B.step(dt);
+    A.render(rtA, aspect); B.render(rtB, aspect);
+    const tp = tpass(trans.name), pr = clamp(trans.p);
+    // reverse navigation plays the incoming transition backwards: swap inputs and run p from 1 to 0
+    tp.u.tA.value = trans.reverse ? rtB.texture : rtA.texture; tp.u.tB.value = trans.reverse ? rtA.texture : rtB.texture;
+    tp.u.p.value = trans.reverse ? 1 - pr : pr; tp.u.uAspect.value = aspect; tp.u.uTime.value = now / 1000;
+    tp.render(rtC); post.u.tA.value = rtC.texture;
+    if (trans.p >= 1) { trans = null; emit(); }
+  } else {
+    const S = slots[cur]; S.step(dt); S.render(rtA, aspect); post.u.tA.value = rtA.texture;
+    if (auto) { const s = S.s; if (s.p[s.beat] >= 1 && (holdT += dt) > (S.def.beats[s.beat].hold ?? 2)) deck.advance(); }
+  }
+  post.u.uTime.value = now / 1000; post.u.uBlack.value = black; post.render(null);
+}
+
+/* ============================================================
+   8. UI: hud page number, notes, overview, help, toast, hash routing, keys
+   ============================================================ */
+const ui = document.getElementById('ui');
+const el = (tag, cls, html = '') => { const e = document.createElement(tag); if (cls) e.className = cls; e.innerHTML = html; return e; };
+const hud = el('div', 'hud'); ui.append(hud);
+let notesEl = null, overEl = null, helpEl = null, notesWin = null, toastT;
+const toast = msg => { let t = ui.querySelector('.toast'); if (!t) ui.append(t = el('div', 'toast')); t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(toastT); toastT = setTimeout(() => t.style.opacity = 0, 1400); };
+function refresh() {
+  const f = deck.info; hud.textContent = `${f.i + 1} / ${f.n}`; hud.style.color = f.hud;
+  const h = `#${f.id}${f.beat ? '-' + (f.beat + 1) : ''}`; if (location.hash !== h) history.replaceState(null, '', h);
+  const meta = `${f.i + 1}/${f.n} · ${f.title} · beat ${f.beat + 1}/${slots[f.i].s.n}`;
+  if (notesEl) notesEl.innerHTML = `<p>${f.notes}</p><span class="meta">${meta}</span>`;
+  if (notesWin && !notesWin.closed) { notesWin.document.getElementById('n').textContent = f.notes; notesWin.document.getElementById('m').textContent = meta; }
+}
+deck.on(refresh);
+function toggleNotes() {        // first try a separate presenter window (for a second screen); fall back to an inline bar
+  if (notesEl) { notesEl.remove(); notesEl = null; return; }
+  if (!notesWin || notesWin.closed) {
+    try { notesWin = window.open('', 'deck-notes', 'width=760,height=480'); } catch { notesWin = null; }
+    if (notesWin) { notesWin.document.body.innerHTML = '<style>body{margin:0;background:#101218;color:#f2f4f8;font:28px/1.45 system-ui;padding:40px}#m{color:#a4abb8;font-size:20px;margin-top:24px}</style><div id="n"></div><div id="m"></div>';
+      notesWin.document.onkeydown = onKey; refresh(); return; }
+  }
+  notesEl = el('div', 'notes'); ui.append(notesEl); refresh();
+}
+function toggleOverview() {
+  if (overEl) { overEl.remove(); overEl = null; canvas.focus(); return; }
+  overEl = el('div', 'over'); ui.append(overEl);
+  slots.forEach((sl, i) => { const b = el('button', '', `<div class="th"></div><span>${i + 1}. ${sl.def.title}</span>`);
+    b.setAttribute('aria-current', i === cur); b.onclick = () => { deck.jump(i); toggleOverview(); }; overEl.append(b);
+    requestAnimationFrame(() => { b.querySelector('.th').style.backgroundImage = `url(${deck.thumb(i)})`; }); });
+  overEl.querySelector('[aria-current=true]')?.focus();
+}
+function toggleHelp() {
+  if (helpEl) { helpEl.remove(); helpEl = null; return; }
+  helpEl = el('div', 'help', [['→ / Space', 'next'], ['←', 'back'], ['Home / End', 'first / last'], ['O', 'overview'], ['N', 'speaker notes'],
+    ['F', 'fullscreen'], ['A', 'autoplay'], ['M', 'sound'], ['B / .', 'black screen'], ['?', 'this help']].map(([k, v]) => `<b>${k}</b><span>${v}</span>`).join(''));
+  ui.append(helpEl);
+}
+function onKey(e) {
+  if (e.metaKey || e.ctrlKey || e.altKey) return; const k = e.key; audio.unlock();
+  if (overEl && !['Escape', 'o', 'O', 'Enter', ' '].includes(k)) return;
+  if (['ArrowRight', 'ArrowDown', ' ', 'PageDown', 'Enter'].includes(k)) { if (overEl) return; e.preventDefault(); if (!e.repeat) deck.advance(); }
+  else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace'].includes(k)) { e.preventDefault(); if (!e.repeat) deck.back(); }
+  else if (k === 'Home') deck.jump(0); else if (k === 'End') deck.jump(slots.length - 1);
+  else if (k === 'f' || k === 'F') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
+  else if (k === 'a' || k === 'A') { deck.setAuto(!deck.auto); toast(deck.auto ? 'Playing by itself' : 'Manual'); }
+  else if (k === 'm' || k === 'M') { audio.mute(); toast(audio.muted ? 'Sound off' : 'Sound on'); }
+  else if (k === 'n' || k === 'N') toggleNotes(); else if (k === 'o' || k === 'O') toggleOverview();
+  else if (k === '?' || k === 'h' || k === 'H') toggleHelp(); else if (k === 'b' || k === 'B' || k === '.') deck.toggleBlack();
+  else if (k === 'Escape') { if (overEl) toggleOverview(); if (helpEl) toggleHelp(); }
+}
+addEventListener('keydown', onKey);
+// click / tap: right two-thirds = next, left third = back
+canvas.addEventListener('pointerup', e => { audio.unlock(); (e.clientX < innerWidth / 3 ? deck.back : deck.advance)(); });
+let idleT; const wake = () => { document.body.classList.remove('idle'); clearTimeout(idleT); idleT = setTimeout(() => document.body.classList.add('idle'), 2200); };
+addEventListener('pointermove', wake); wake();
+const fromHash = () => { const m = /^#([a-z0-9-]+?)(?:-(\d+))?$/.exec(location.hash); if (!m) return null;
+  const i = slots.findIndex(s => s.def.id === m[1]); return i < 0 ? null : [i, m[2] ? +m[2] - 1 : 0]; };
+addEventListener('hashchange', () => { const h = fromHash(); if (h && (h[0] !== cur || h[1] !== slots[cur].s.beat)) deck.jump(h[0], h[1]); });
+
+/* ============================================================
+   9. BOOT: wait for fonts (text is rasterised once), build first scene, start
+   ============================================================ */
+(async () => {
+  try { await Promise.race([Promise.all(['400 40px Newsreader', 'italic 300 40px Newsreader', '500 40px "Geist Mono"', '40px Anton'].map(f => document.fonts.load(f))), new Promise(r => setTimeout(r, 2500))]); } catch {}
+  resize();
+  const h = fromHash() || [0, 0];
+  slots[h[0]].ensure(); deck.jump(h[0], h[1]);
+  ui.querySelector('.load').remove(); canvas.focus();
+  window.deck = deck;                      // handy for debugging + automated screenshots
+  requestAnimationFrame(t => { last = t; frame(t); });
+})();
+</script>
+</body>
+</html>
